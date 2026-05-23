@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VedaActive Wellness | Onboarding</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 flex items-center justify-center min-h-screen">
+    <div class="bg-white p-8 rounded-2xl shadow-xl max-w-md w-full border border-slate-100">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-slate-800">VedaActive</h1>
+            <p class="text-slate-500">Begin your AI-Powered Coaching journey</p>
+        </div>
+
+        <div id="registration-form" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-slate-700">Full Name</label>
+                <input type="text" id="name" class="w-full mt-1 p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" placeholder="John Doe">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-slate-700">Email Address</label>
+                <input type="email" id="email" class="w-full mt-1 p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" placeholder="john@example.com">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-slate-700">Telegram Chat ID</label>
+                <input type="text" id="telegram_id" class="w-full mt-1 p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" placeholder="123456789">
+                <p class="text-xs text-slate-400 mt-1">Get this from @userinfobot on Telegram</p>
+            </div>
+            <button onclick="register()" id="reg-btn" class="w-full bg-blue-600 text-white p-3 rounded-lg font-semibold hover:bg-blue-700 transition">Create My Profile</button>
+        </div>
+
+        <div id="strava-section" class="hidden text-center space-y-6">
+            <div class="bg-green-50 p-4 rounded-lg text-green-700 text-sm">
+                Profile created successfully! Now connect your data.
+            </div>
+            <a id="strava-link" href="#" class="inline-block bg-[#FC6100] text-white px-8 py-3 rounded-lg font-bold hover:opacity-90 transition">
+                Connect with STRAVA
+            </a>
+        </div>
+    </div>
+
+    <script>
+        async function register() {
+            const btn = document.getElementById('reg-btn');
+            btn.innerText = "Processing...";
+            btn.disabled = true;
+
+            const name = document.getElementById('name').value;
+            const email = document.getElementById('email').value;
+            const telegram_id = document.getElementById('telegram_id').value;
+
+            try {
+                // Adjust the URL if your server uses a different domain/port
+                const response = await fetch(`/auth/register?name=${name}&email=${email}&telegram_id=${telegram_id}`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (data.status === "success") {
+                    document.getElementById('registration-form').classList.add('hidden');
+                    document.getElementById('strava-section').classList.remove('hidden');
+                    document.getElementById('strava-link').href = data.strava_link;
+                } else {
+                    alert("Error: " + (data.detail || "Registration failed"));
+                    btn.innerText = "Create My Profile";
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                alert("Connection error. Is the server running?");
+                btn.innerText = "Create My Profile";
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

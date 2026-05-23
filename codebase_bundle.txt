@@ -1,0 +1,4182 @@
+=========================================
+FILE: backend/scheduler.py
+=========================================
+# Cleaned: Handled by Celery Beat
+
+
+=========================================
+FILE: backend/pdf_utils.py
+=========================================
+# backend/pdf_utils.py
+import io
+import logging
+from pypdf import PdfReader
+
+logger = logging.getLogger(__name__)
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """
+    Extracts plain text from raw PDF bytes.
+    """
+    try:
+        pdf_file = io.BytesIO(pdf_bytes)
+        reader = PdfReader(pdf_file)
+        text = ""
+        for page_num, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+        return text.strip()
+    except Exception:
+        logger.exception("❌ Error extracting text from PDF bytes")
+        return ""
+
+
+=========================================
+FILE: backend/celery_app.py
+=========================================
+# backend/celery_app.py
+import os
+from celery import Celery
+from celery.schedules import crontab
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+celery_app = Celery(
+    "veda_coach_tasks",
+    broker=REDIS_URL,
+    backend=REDIS_URL,
+    include=[
+        "backend.tasks.sync_tasks",
+        "backend.tasks.coaching_tasks"
+    ]
+)
+
+# Operational Configuration for High-Performance Async Operations
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="Asia/Kolkata",
+    enable_utc=False,
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
+
+    # Dedicated Task Route Separators (Solves Queue Starvation)
+    task_routes={
+        "backend.tasks.coaching_tasks.generate_async_response": {"queue": "chat_critical"},
+        "backend.tasks.sync_tasks.trigger_periodic_sync": {"queue": "data_sync"},
+        "backend.tasks.sync_tasks.trigger_onboarding_backfill": {"queue": "onboarding_heavy"},
+        "backend.tasks.coaching_tasks.trigger_daily_morning_briefing": {"queue": "scheduled_reports"},
+        "backend.tasks.sync_tasks.trigger_snapshot_refresh": {"queue": "scheduled_reports"},
+        "backend.tasks.coaching_tasks.trigger_weekly_compression": {"queue": "scheduled_reports"}, # Added routing for weekly compression
+    }
+)
+
+celery_app.conf.beat_schedule = {
+    "run-activity-sync-every-5-minutes": {
+        "task": "backend.tasks.sync_tasks.trigger_periodic_sync",
+        "schedule": 300.0,
+    },
+    "run-daily-morning-briefing-at-6am": {
+        "task": "backend.tasks.coaching_tasks.trigger_daily_morning_briefing",
+        "schedule": crontab(hour=6, minute=0),
+    },
+    "refresh-athlete-snapshots-every-30-minutes": {
+        "task": "backend.tasks.sync_tasks.trigger_snapshot_refresh",
+        "schedule": 1800.0, # Exactly 30 minutes
+    },
+    # 🧹 Added Memory Compression: Wakes up every Sunday at midnight
+    "weekly-memory-compression": {
+        "task": "backend.tasks.coaching_tasks.trigger_weekly_compression",
+        "schedule": crontab(hour=0, minute=0, day_of_week=0),
+    }
+}
+
+
+=========================================
+FILE: backend/llm_service.py
+=========================================
+import os
+import json
+import logging
+from datetime import datetime
+
+from openai import OpenAI
+from dotenv import load_dotenv
+from sqlalchemy.orm import Session
+
+from backend.models import CoachMemory
+
+# =========================
+# 🔧 INIT
+# =========================
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# 🤖 GENERATE COACH RESPONSE
+# =========================
+def generate_coach_response(context: dict) -> str:
+    """
+    Main LLM call for coaching response with strict length controls.
+    """
+
+    # Enforce strict brevity, direct tips, and zero report-writing patterns
+    system_message = context.get(
+        "system_instructions",
+        """You are an elite endurance running coach. Your tone is professional, direct, and highly focused.
+
+Rules:
+1. STRICT BREVITY: Keep your total response under 150 words (maximum 3 to 4 sentences).
+2. NO FILLER: Skip conversational fluff, introductory greetings (e.g., "I hope you are doing well"), and warm sign-offs (e.g., "Onward and upward").
+3. DIRECT ACTION: Immediately address the athlete's prompt using their metrics, and provide exactly ONE clear, practical next step.
+4. Avoid generating long, structured outlines, multiple headings, or complete nutrition/recovery templates unless explicitly asked.
+5. If data is missing → state it briefly, do not hallucinate.
+"""
+    )
+
+    prompt = f"""
+Athlete Name: {context.get('athlete_name')}
+
+Performance Summary:
+{context.get('performance')}
+
+Recent Form:
+{context.get('recent_form')}
+
+Personal Bests:
+{context.get('personal_bests')}
+
+Fatigue Status: {context.get('fatigue')}
+Fatigue Trend: {context.get('fatigue_trend')}
+
+Goal:
+{context.get('goal')}
+
+Conversation History:
+{context.get('history')}
+
+Athlete's Message:
+"{context.get('user_input')}"
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+
+        return response.choices[0].message.content.strip()
+
+    except Exception:
+        logger.exception("❌ LLM response generation failed")
+        return "⚠️ I'm having trouble analyzing right now. Try again in a moment."
+
+
+# =========================
+# 🧠 MEMORY EXTRACTION
+# =========================
+def extract_and_save_memory(
+    db: Session,
+    user_id: int,
+    user_input: str,
+    ai_response: str
+):
+    """
+    Extracts long-term useful insights and stores them
+    """
+
+    extraction_prompt = f"""
+Analyze this athlete conversation:
+
+User: "{user_input}"
+Coach: "{ai_response}"
+
+Extract ONE useful long-term insight if present, such as:
+- injury
+- goal
+- preference
+- limitation
+
+Return ONLY JSON:
+{{"insight": "short fact"}}
+
+If nothing useful → return NONE
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Extract structured athlete insights."},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            temperature=0
+        )
+
+        result = response.choices[0].message.content.strip()
+
+        if result.upper() == "NONE":
+            return
+
+        # Clean formatting (in case model wraps JSON)
+        clean = result.replace("```json", "").replace("```", "").strip()
+
+        if not clean.startswith("{"):
+            return
+
+        data = json.loads(clean)
+        insight_text = data.get("insight")
+
+        if insight_text:
+            memory = CoachMemory(
+                user_id=user_id,
+                role="system",
+                content=insight_text,
+                created_at=datetime.utcnow()
+            )
+
+            db.add(memory)
+            db.commit()
+
+            logger.info(f"🧠 Memory saved: {insight_text}")
+
+    except Exception:
+        db.rollback()
+        logger.exception("❌ Failed to extract memory")
+
+
+# =========================
+# 🩺 MEDICAL PDF ANALYSER
+# =========================
+def process_medical_pdf_with_llm(raw_pdf_text: str, athlete_name: str) -> str:
+    """
+    Parses complex medical reports and summarizes critical coaching boundaries.
+    """
+    system_instruction = (
+        "You are an Elite Medical Analyst for Endurance Training. "
+        "Your task is to read raw medical reports and extract ONLY items that directly affect sports training."
+    )
+    
+    prompt = f"""
+Analyze this raw medical text for athlete {athlete_name}.
+Extract key indicators under these strict categories:
+1. Cardiovascular Metrics (e.g., resting heart rate, ECG findings)
+2. Musculoskeletal / Injury warning signs (e.g., knee, tendon, back reports)
+3. Nutritional Deficiencies (e.g., low Iron, Ferritin, Vitamin D)
+4. Active Restrictions (What the doctor explicitly said NOT to do, if any)
+
+Be extremely clear and list only verified medical boundaries.
+
+---
+RAW REPORT TEXT:
+{raw_pdf_text}
+---
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        logger.exception("❌ Medical report extraction failed")
+        return "No specific issues identified. Proceed with baseline thresholds."
+
+
+=========================================
+FILE: backend/time_utils.py
+=========================================
+from datetime import datetime, timezone, timedelta
+
+# IST = UTC + 5:30
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+# =========================
+# 🌍 UTC → IST CONVERSION
+# =========================
+def utc_to_ist(utc_str: str):
+    """
+    Convert Strava UTC timestamp string to IST datetime
+    Example input: "2024-01-01T05:30:00Z"
+    """
+    if not utc_str:
+        return None
+
+    try:
+        # Handle 'Z' (Zulu time)
+        if utc_str.endswith("Z"):
+            utc_str = utc_str.replace("Z", "+00:00")
+
+        dt = datetime.fromisoformat(utc_str)
+        return dt.astimezone(IST)
+
+    except Exception:
+        return None
+
+
+# =========================
+# ⏰ GET CURRENT IST TIME
+# =========================
+def get_ist_now():
+    """
+    Returns current IST datetime
+    """
+    return datetime.now(IST)
+
+
+# =========================
+# 🕒 GET CURRENT UTC TIME
+# =========================
+def get_utc_now():
+    """
+    Returns current UTC datetime
+    """
+    return datetime.now(timezone.utc)
+
+
+# =========================
+# 📅 FORMAT DATETIME
+# =========================
+def format_datetime(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S"):
+    """
+    Format datetime safely
+    """
+    if not dt:
+        return None
+
+    try:
+        return dt.strftime(fmt)
+    except Exception:
+        return None
+
+
+# =========================
+# 🔁 IST → UTC (OPTIONAL)
+# =========================
+def ist_to_utc(dt: datetime):
+    """
+    Convert IST datetime to UTC
+    """
+    if not dt:
+        return None
+
+    try:
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+# =========================
+# ⏳ TIME DIFFERENCE (MINUTES)
+# =========================
+def minutes_between(dt1: datetime, dt2: datetime):
+    """
+    Returns difference in minutes between two datetimes
+    """
+    if not dt1 or not dt2:
+        return None
+
+    try:
+        delta = dt2 - dt1
+        return int(delta.total_seconds() / 60)
+    except Exception:
+        return None
+
+
+=========================================
+FILE: backend/plan_generator.py
+=========================================
+# backend/plan_generator.py
+from backend.models import User
+from backend.analytics import get_fatigue_metrics
+from backend.athlete_state.physiology_engine import PhysiologyEngine
+
+def generate_training_plan(db, user_id, goal="general"):
+    """
+    Generates an adaptive, biometric-locked training plan
+    based on real-time fatigue, goal, and the athlete's precise HR Zones.
+    """
+    atl, ctl, tsb, fatigue = get_fatigue_metrics(db, user_id)
+    user = db.query(User).filter_by(id=user_id).first()
+    
+    # Calculate physiological thresholds dynamically
+    zones = PhysiologyEngine.calculate_hr_zones(user) if user else {
+        "zone1": 115, "zone2": 133, "zone3": 152, "zone4": 171, "zone5": 190
+    }
+    
+    goal = (goal or "general").lower()
+
+    # =========================
+    # 🔴 OVERTRAINING CASE
+    # =========================
+    if fatigue == "Overtraining" or tsb < -20:
+        plan = [
+            "Complete Rest Day - Active recovery / stretching only.",
+            "Light mobility / foam rolling.",
+            f"Very easy recovery jog (Zone 1: Under {zones['zone1']} bpm) - max 20 mins."
+        ]
+        note = "Your system is showing high fatigue. Prioritize recovery to prevent injury."
+
+    # =========================
+    # 🟡 HIGH FATIGUE
+    # =========================
+    elif tsb < -5:
+        plan = [
+            f"Easy Recovery Run (Zone 1/2: {zones['zone1']}-{zones['zone2']} bpm) - max 30 mins.",
+            "Light walk / low-impact active movement.",
+            f"Zone 2 Endurance Session (Target: {zones['zone1']}-{zones['zone2']} bpm) - max 40 mins."
+        ]
+        note = "Ensure yesterday's training stress is absorbed. Keep intensity low."
+
+    # =========================
+    # 🟢 GOOD FORM (OPTIMAL TRAINING)
+    # =========================
+    elif -5 <= tsb <= 10:
+        if "marathon" in goal:
+            plan = [
+                f"Long Aerobic Run (Zone 2 Baseline: {zones['zone1']}-{zones['zone2']} bpm) - Building aerobic volume.",
+                f"Active Recovery Jog (Zone 1: Under {zones['zone1']} bpm) - 30 mins.",
+                f"Tempo Block (10 min Warmup -> 20 mins in Zone 3: {zones['zone2']}-{zones['zone3']} bpm -> 10 min Cooldown)."
+            ]
+        elif "5k" in goal or "10k" in goal:
+            plan = [
+                f"Interval speed work (4 x 800m hitting Zone 4: {zones['zone3']}-{zones['zone4']} bpm, with full recovery jogs).",
+                f"Easy Base Run (Zone 2: {zones['zone1']}-{zones['zone2']} bpm) - 45 mins.",
+                f"Threshold Tempo (30 mins steady effort in Zone 3: {zones['zone2']}-{zones['zone3']} bpm)."
+            ]
+        else:
+            plan = [
+                f"Steady Base Run (Zone 2: {zones['zone1']}-{zones['zone2']} bpm) - 45 mins.",
+                f"Active Recovery Jog (Zone 1: Under {zones['zone1']} bpm) - 30 mins.",
+                f"Mixed Fartlek (Warmup -> 5x 1-min repeats in Zone 4: {zones['zone3']}-{zones['zone4']} bpm -> Cooldown)."
+            ]
+        note = "Your training stress balance is optimal. Proceed with targeted quality sessions."
+
+    # =========================
+    # 🔵 FRESH (LOW FATIGUE)
+    # =========================
+    else:
+        plan = [
+            f"Speed Intervals (6 x 400m reaching Zone 4/5: {zones['zone3']}-{zones['zone5']} bpm).",
+            f"Endurance Run (Zone 2 Baseline: {zones['zone1']}-{zones['zone2']} bpm) - 60 mins.",
+            f"Threshold Progression Run (Zone 2 running into Zone 3: {zones['zone1']}-{zones['zone3']} bpm)."
+        ]
+        note = "You are carrying very low fatigue. High capacity for quality cardiovascular stress."
+
+    # =========================
+    # 📤 FORMAT OUTPUT
+    # =========================
+    msg = f"📅 *Adaptive 3-Day Training Protocol*\n"
+    msg += f"🎯 Target Goal: {goal.capitalize()}\n"
+    msg += f"⚡ Fatigue Balance: {fatigue} (TSB: {round(tsb, 1)})\n\n"
+
+    for i, day in enumerate(plan, 1):
+        msg += f"*Day {i}:* {day}\n"
+
+    msg += f"\n💡 *Coach Note:* {note}"
+    return msg
+
+
+=========================================
+FILE: backend/training_system/periodization_engine.py
+=========================================
+# backend/training_system/periodization_engine.py
+import math
+import logging
+from datetime import datetime, timedelta
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+class PeriodizationEngine:
+    """
+    Algorithmic Training Periodization and Overload System.
+    Manages macrocycles, mesocycles, progression blocks, and race taper decay curves.
+    """
+
+    @staticmethod
+    def calculate_macrocycle_phase(user: User, race_date: datetime) -> str:
+        """
+        Determines the current training macrocycle based on the time remaining until race day.
+        """
+        if not race_date:
+            return "Base"
+        
+        days_to_race = (race_date - datetime.utcnow()).days
+        weeks_to_race = math.ceil(days_to_race / 7.0)
+
+        if weeks_to_race <= 0:
+            return "Recovery"
+        elif weeks_to_race <= 1:
+            return "Race Week"
+        elif weeks_to_race <= 3:
+            return "Taper"
+        elif weeks_to_race <= 8:
+            return "Peak"
+        elif weeks_to_race <= 16:
+            return "Build"
+        else:
+            return "Base"
+
+    @staticmethod
+    def calculate_weekly_tss_target(user: User, historical_activities: list) -> float:
+        """
+        Sets the weekly training load target (TSS) using periodized overload patterns.
+        Applies a 3-week build followed by a 1-week deload structure.
+        """
+        if not historical_activities:
+            return user.target_weekly_tss or 150.0
+
+        # Calculate the athlete's 3-week rolling baseline load
+        recent_3_weeks = [a for a in historical_activities if a.start_date_utc >= datetime.utcnow() - timedelta(days=21)]
+        if not recent_3_weeks:
+            return user.target_weekly_tss or 150.0
+
+        baseline_avg_weekly_tss = sum(a.training_stress_score_tss or 0.0 for a in recent_3_weeks) / 3.0
+        week_num = (user.macrocycle_week % 4) or 4 # 1, 2, 3 (Build Weeks), 4 (Deload Week)
+
+        phase = user.training_phase or "Base"
+        fatigue_accumulation = user.fatigue_accumulation_rate or 1.0
+
+        # Run periodized load step-ups based on the current week
+        if week_num == 1:
+            # Step up target relative to rolling baseline
+            target_tss = baseline_avg_weekly_tss * 1.05
+        elif week_num == 2:
+            # Overload Step-up 1
+            target_tss = baseline_avg_weekly_tss * 1.12
+        elif week_num == 3:
+            # Overload Step-up 2 (Max Overload)
+            target_tss = baseline_avg_weekly_tss * 1.18 * (1.0 / fatigue_accumulation)
+        else:
+            # Deload/Recovery Week (Drop load to consolidate gains)
+            target_tss = baseline_avg_weekly_tss * 0.70
+
+        # Cap the target to prevent sudden workload spikes (> 20% week-on-week load jumps)
+        max_safe_limit = baseline_avg_weekly_tss * 1.22
+        final_target = min(max_safe_limit, max(100.0, target_tss))
+        return round(final_target, 1)
+
+    @staticmethod
+    def calculate_race_taper_decay(weeks_to_race: int, baseline_volume_km: float) -> float:
+        """
+        Calculates exponential taper decay to shed physiological fatigue while maintaining
+        neuromuscular sharpness before race day.
+        Formula: V_taper = V_baseline * e^(-0.25 * t)
+        """
+        if weeks_to_race <= 0:
+            return 0.0
+        # Exponential volume reduction coefficient
+        decay_factor = math.exp(-0.25 * (3.0 - weeks_to_race))
+        return round(baseline_volume_km * max(0.40, min(1.0, decay_factor)), 1)
+
+
+=========================================
+FILE: backend/notifications.py
+=========================================
+# backend/notifications.py
+import os
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ========================================================
+# 🔧 CONFIGURATION
+# ========================================================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+# ========================================================
+# 📩 CORE SEND FUNCTION
+# ========================================================
+def _send(payload: dict):
+    try:
+        res = requests.post(
+            f"{BASE_URL}/sendMessage",
+            json=payload,
+            timeout=10
+        )
+
+        if res.status_code == 200:
+            return True
+
+        logger.error(f"❌ Telegram API error: {res.status_code} | {res.text}")
+        return False
+
+    except Exception as e:
+        logger.exception(f"❌ Telegram request failed: {e}")
+        return False
+
+
+# ========================================================
+# 📩 SEND TEXT MESSAGE
+# ========================================================
+def send_telegram_message(text: str, chat_id: str):
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+
+    success = _send(payload)
+
+    if success:
+        logger.info(f"✅ Message sent to {chat_id}")
+    return success
+
+
+# ========================================================
+# 🔗 SEND URL BUTTON
+# ========================================================
+def send_telegram_url_button(text: str, button_text: str, url: str, chat_id: str):
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {
+                    "text": button_text,
+                    "url": url
+                }
+            ]]
+        }
+    }
+
+    success = _send(payload)
+
+    if success:
+        logger.info(f"🔗 URL button sent to {chat_id}")
+    return success
+
+
+# ========================================================
+# 🔘 SEND CALLBACK BUTTONS (UX Upgraded)
+# ========================================================
+def send_telegram_buttons(text: str, buttons: list, chat_id: str):
+    """
+    Upgraded: Supports both standard lists of strings AND list of dict structures
+    to completely separate clean display names from system-bound callback payloads.
+
+    Examples:
+    1. List of Strings (Standard Actions):
+       send_telegram_buttons("Choose:", ["Start Training", "View Plan"], chat_id)
+
+    2. List of Dicts (Upgraded Personas):
+       send_telegram_buttons("Choose Persona:", [
+           {"text": "🔬 Coach Veda (Scientist)", "callback_data": "PERSONA:veda"},
+           {"text": "⚡ Captain Dev (Sergeant)", "callback_data": "PERSONA:dev"}
+       ], chat_id)
+    """
+    keyboard = []
+    for btn in buttons:
+        if isinstance(btn, dict):
+            # Dynamic dictionary mapping text to data
+            keyboard.append([{"text": btn["text"], "callback_data": btn["callback_data"]}])
+        else:
+            # Fallback to single string configuration
+            keyboard.append([{"text": btn, "callback_data": btn}])
+
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": keyboard
+        }
+    }
+
+    success = _send(payload)
+
+    if success:
+        logger.info(f"🔘 Buttons sent to {chat_id}")
+    return success
+
+
+=========================================
+FILE: backend/strava_manager.py
+=========================================
+# backend/strava_manager.py
+import os
+import httpx
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
+from sqlalchemy.orm import Session
+from dateutil import parser
+
+from backend.database import SessionLocal
+from backend.models import User, Activity, StravaToken, DailyReadiness
+
+logger = logging.getLogger(__name__)
+
+class StravaManager:
+    def __init__(self):
+        self.client_id = os.getenv("STRAVA_CLIENT_ID")
+        self.client_secret = os.getenv("STRAVA_CLIENT_SECRET")
+        self.base_url = "https://www.strava.com/api/v3"
+
+    # ==================================
+    # 🔑 TOKEN MANAGEMENT (ASYNC-SAFE)
+    # ==================================
+    async def get_valid_token(self, db: Session, user_id: int) -> Optional[str]:
+        token = db.query(StravaToken).filter_by(user_id=user_id).first()
+        if not token:
+            return None
+
+        now = datetime.now(timezone.utc).timestamp()
+        if now < (token.expires_at - 300):
+            return token.access_token
+
+        logger.info(f"🔄 Refreshing Strava access token for user {user_id}")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://www.strava.com/oauth/token",
+                data={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": token.refresh_token
+                },
+                timeout=10
+            )
+
+        if resp.status_code != 200:
+            logger.error(f"❌ Token refresh failed: {resp.text}")
+            return None
+
+        data = resp.json()
+        token.access_token = data["access_token"]
+        token.refresh_token = data["refresh_token"]
+        token.expires_at = data["expires_at"]
+        db.commit()
+        return token.access_token
+
+    # ==================================
+    # 💾 HIGH-PERFORMANCE BULK SAVER
+    # ==================================
+    def bulk_save_activities(self, db: Session, user_id: int, activities: List[Dict]) -> int:
+        """
+        Saves activities in bulk, checking deduplication in a single step
+        to prevent N+1 database query round-trips.
+        """
+        if not activities:
+            return 0
+
+        incoming_ids = [int(act["id"]) for act in activities]
+
+        existing = db.query(Activity.strava_id).filter(
+            Activity.user_id == user_id,
+            Activity.strava_id.in_(incoming_ids)
+        ).all()
+        existing_ids: Set[int] = {r[0] for r in existing}
+
+        new_count = 0
+        for act in activities:
+            strava_id = int(act["id"])
+            if strava_id in existing_ids:
+                continue
+
+            new_act = Activity(
+                user_id=user_id,
+                strava_id=strava_id,
+                name=act.get("name"),
+                distance_km=act.get("distance", 0) / 1000,
+                moving_time_min=act.get("moving_time", 0) / 60,
+                elapsed_time_min=act.get("elapsed_time", 0) / 60,
+                type=act.get("type"),
+                start_date_utc=parser.parse(act.get("start_date")),
+                avg_heart_rate=act.get("average_heartrate"),
+                max_heart_rate=act.get("max_heartrate")
+            )
+            db.add(new_act)
+            new_count += 1
+
+        if new_count > 0:
+            db.commit()
+            logger.info(f"💾 Bulk saved {new_count} new runs for user_id {user_id}")
+        return new_count
+
+    # ==================================
+    # 🔄 PERIODIC SYNC PIPELINE
+    # ==================================
+    async def sync_recent(self):
+        db = SessionLocal()
+        try:
+            users = db.query(User).all()
+            for user in users:
+                token = await self.get_valid_token(db, user.id)
+                if not token:
+                    continue
+
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(
+                        f"{self.base_url}/athlete/activities",
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"per_page": 10},
+                        timeout=10
+                    )
+
+                if res.status_code == 200:
+                    self.bulk_save_activities(db, user.id, res.json())
+        except Exception as e:
+            logger.error(f"❌ Periodic activity sync failed: {str(e)}")
+        finally:
+            db.close()
+
+    # ==================================
+    # 📥 HISTORICAL BACKFILL ENGINE
+    # ==================================
+    async def backfill(self, user_id: int, max_activities_limit: int = 600) -> int:
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(id=user_id).first()
+            if not user:
+                return 0
+
+            token = await self.get_valid_token(db, user_id)
+            if not token:
+                return 0
+
+            page = 1
+            total_saved = 0
+            per_page_limit = 200
+
+            async with httpx.AsyncClient() as client:
+                while total_saved < max_activities_limit:
+                    res = await client.get(
+                        f"{self.base_url}/athlete/activities",
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"per_page": per_page_limit, "page": page},
+                        timeout=15
+                    )
+
+                    if res.status_code != 200:
+                        break
+
+                    activities = res.json()
+                    if not activities:
+                        break
+
+                    new_saves = self.bulk_save_activities(db, user_id, activities)
+                    total_saved += new_saves
+
+                    if len(activities) < per_page_limit:
+                        break
+                    page += 1
+
+            return total_saved
+        finally:
+            db.close()
+
+    # ==================================
+    # 🛰️ REAL-TIME WEBHOOK ORCHESTRATOR
+    # ==================================
+    async def handle_webhook(self, athlete_id: int, activity_id: int):
+        db = SessionLocal()
+        try:
+            token_rec = db.query(StravaToken).filter_by(athlete_id=athlete_id).first()
+            if not token_rec:
+                return
+
+            user = db.query(User).filter_by(id=token_rec.user_id).first()
+            if not user:
+                return
+
+            token = await self.get_valid_token(db, user.id)
+            if not token:
+                return
+
+            async with httpx.AsyncClient() as client_http:
+                res = await client_http.get(
+                    f"{self.base_url}/activities/{activity_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10
+                )
+
+            if res.status_code != 200:
+                return
+
+            activity = res.json()
+            self.bulk_save_activities(db, user.id, [activity])
+
+            saved_act = db.query(Activity).filter_by(strava_id=activity_id).first()
+
+            from backend.analytics import update_user_fitness_metrics
+            update_user_fitness_metrics(db, user.id)
+
+            workout_prompt = f"Analyze my completed workout: {saved_act.name} of {saved_act.distance_km} km. Detail my physiological cardiac cost and recovery priority."
+
+            # ✅ Local import to break circular dependency
+            from backend.orchestration.coach_service import CoachService
+            response = CoachService.generate(
+                db=db,
+                user_id=user.id,
+                user_input=workout_prompt,
+                activity_data=saved_act
+            )
+
+            if user.telegram_chat_id:
+                from backend.notifications import send_telegram_message, send_telegram_buttons
+                send_telegram_message(
+                    f"🏃‍♂️ *New Workout Logged:* {activity.get('name')} ({round(saved_act.distance_km, 2)} km)\n\n{response}",
+                    user.telegram_chat_id
+                )
+
+                send_telegram_buttons(
+                    f"How did the effort of *{activity.get('name')}* feel on a scale of 1 (Recovery) to 10 (Max Effort)?",
+                    ["RPE: 1-3 (Easy)", "RPE: 4-6 (Moderate)", "RPE: 7-8 (Hard)", "RPE: 9-10 (Max)"],
+                    user.telegram_chat_id
+                )
+
+        except Exception as e:
+            logger.error(f"❌ Webhook handle failed: {str(e)}", exc_info=True)
+        finally:
+            db.close()
+
+
+    # ==================================
+    # 🏁 AUTOMATED DEEP ONBOARDING
+    # ==================================
+    async def handle_new_user_onboarding(self, user_id: int):
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(id=user_id).first()
+            if not user:
+                return
+
+            logger.info(f"🏁 Starting onboarding pipelines for: {user.name}")
+            total_synced = await self.backfill(user_id=user.id, max_activities_limit=600)
+
+            from backend.analytics import update_user_fitness_metrics
+            logger.info("🔥 Recalculating and writing individual training stress scores (TSS)...")
+            update_user_fitness_metrics(db, user.id)
+
+            # ✅ Localized imports to ensure zero namespace drift during bootup
+            from backend.athlete_state.fatigue_engine import FatigueEngine
+            from backend.athlete_state.recovery_engine import RecoveryEngine
+            from backend.athlete_state.injury_risk_engine import InjuryRiskEngine
+            from backend.orchestration.coach_service import CoachService
+
+            fatigue_metrics = FatigueEngine.calculate(db, user.id)
+            recovery_score = RecoveryEngine.calculate(fatigue_metrics["fatigue_score"])
+            injury_risk = InjuryRiskEngine.evaluate(fatigue_metrics["acwr"], fatigue_metrics["fatigue_score"])
+
+            user.ctl = round(fatigue_metrics["chronic_load"] / 6.0, 1)
+            user.atl = round(fatigue_metrics["acute_load"], 1)
+            user.tsb = round(user.ctl - user.atl, 1)
+            user.coaching_state = "Active Base"
+            user.last_sync_at = datetime.utcnow()
+
+            readiness = DailyReadiness(
+                user_id=user.id,
+                fatigue_score=float(fatigue_metrics["fatigue_score"]),
+                recovery_score=float(recovery_score),
+                injury_risk=injury_risk
+            )
+            db.add(readiness)
+            db.commit()
+
+            first_dispatch = CoachService.generate(db, user.id)
+
+            if user.telegram_chat_id:
+                from backend.notifications import send_telegram_message, send_telegram_buttons
+                send_telegram_message(
+                    f"🥇 *Onboarding Complete, {user.name}!* \n\n"
+                    f"My system has completed processing your historical training profile ({total_synced} workouts analyzed).\n\n"
+                    f"{first_dispatch}",
+                    user.telegram_chat_id
+                )
+
+                persona_introduction = (
+                    "👤 *Meet Your Veda AI Coaching Council*\n"
+                    "Select your active coaching persona. You can change this at any time during your training:\n\n"
+                    "🔬 *Coach Veda (Olympic Scientist)*\n"
+                    "• _Style:_ Highly analytical, precise, and objective.\n"
+                    "• _Focus:_ Cardiovascular decoupling ratios, grade-adjusted TSS, and mechanical split efficiency.\n\n"
+                    "⚡ *Captain Dev (Drill Sergeant)*\n"
+                    "• _Style:_ Direct, commanding, blunt, and highly motivating.\n"
+                    "• _Focus:_ Discipline, strict pacing adherence, and hitting target workout durations without excuses.\n\n"
+                    "🌱 *Coach Priya (Supportive Guide)*\n"
+                    "• _Style:_ Warm, holistic, empathetic, and mindful.\n"
+                    "• _Focus:_ Listening to structural feedback, stress management, active recovery, and nutritional restoration."
+                )
+                send_telegram_message(persona_introduction, user.telegram_chat_id)
+
+                send_telegram_buttons(
+                    "Select your active Coach Persona style:",
+                    [
+                        {"text": "🔬 Coach Veda (Olympic Scientist)", "callback_data": "PERSONA:veda"},
+                        {"text": "⚡ Captain Dev (Drill Sergeant)", "callback_data": "PERSONA:dev"},
+                        {"text": "🌱 Coach Priya (Supportive Guide)", "callback_data": "PERSONA:priya"}
+                    ],
+                    user.telegram_chat_id
+                )
+
+                send_telegram_buttons(
+                    "Select an option to begin managing your training:",
+                    ["Start Training", "View Plan", "Sync Activities"],
+                    user.telegram_chat_id
+                )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Deep onboarding failed: {str(e)}", exc_info=True)
+        finally:
+            db.close()
+
+strava_manager = StravaManager()
+
+
+=========================================
+FILE: backend/analytics.py
+=========================================
+# backend/analytics.py
+import logging
+import math
+from datetime import datetime, timezone, timedelta
+from sqlalchemy.orm import Session
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+def compute_cardiac_decoupling(splits: list, avg_hr: float) -> float:
+    """Calculates aerobic drift by comparing performance in the first and second half of a run."""
+    if not splits or len(splits) < 4 or not avg_hr or avg_hr <= 0:
+        return 0.0
+    try:
+        midpoint = len(splits) // 2
+        first_half = splits[:midpoint]
+        second_half = splits[midpoint:]
+
+        first_half_ef = sum((s.get("distance", 0) / (s.get("elapsed_time", 1) / 60.0)) / avg_hr for s in first_half if s.get("elapsed_time", 0) > 0) / len(first_half)
+        second_half_ef = sum((s.get("distance", 0) / (s.get("elapsed_time", 1) / 60.0)) / avg_hr for s in second_half if s.get("elapsed_time", 0) > 0) / len(second_half)
+
+        if first_half_ef <= 0:
+            return 0.0
+        return round(max(0.0, (first_half_ef - second_half_ef) / first_half_ef), 3)
+    except Exception:
+        return 0.0
+
+def compute_cadence_degradation(splits: list) -> float:
+    """Measures stride fatigue by calculating the decline in average cadence."""
+    if not splits or len(splits) < 3:
+        return 0.0
+    try:
+        first_cadence = splits[0].get("average_cadence", 170.0)
+        last_cadence = splits[-1].get("average_cadence", 170.0)
+        if not first_cadence or first_cadence <= 0 or not last_cadence or last_cadence <= 0:
+            return 0.0
+        return round(max(0.0, (first_cadence - last_cadence) / first_cadence), 3)
+    except Exception:
+        return 0.0
+
+def compute_glycogen_depletion(distance_km: float, moving_time_min: float, user_weight_kg: float = 72.0) -> float:
+    """Estimates glycogen consumption using running metabolic equivalents (METs)."""
+    if not distance_km or not moving_time_min or moving_time_min <= 0:
+        return 0.0
+    try:
+        speed_kmh = (distance_km / moving_time_min) * 60.0
+        met = (0.2 * (speed_kmh * 16.67) + 3.5) / 3.5
+        total_kcal = met * user_weight_kg * (moving_time_min / 60.0)
+        return round(max(0.0, (total_kcal * 0.60) / 4.1), 1)
+    except Exception:
+        return 0.0
+
+def compute_grade_adjusted_tss(activity: Activity, user: User) -> float:
+    """Calculates grade and heat-adjusted training stress score (TSS)."""
+    duration = activity.moving_time_min or 0.0
+    if duration <= 0:
+        return 0.0
+    try:
+        avg_hr = activity.avg_heart_rate
+        rpe = activity.perceived_exertion_rpe or 5
+        rpe_intensity = rpe / 10.0
+
+        if not avg_hr or not user.max_hr or not user.rest_hr:
+            return round((duration * rpe_intensity * (rpe_intensity * 100)) / 60.0, 1)
+
+        hr_reserve = user.max_hr - user.rest_hr
+        if hr_reserve <= 0:
+            return round((duration * rpe_intensity * (rpe_intensity * 100)) / 60.0, 1)
+
+        hr_intensity = max(0.4, min(1.0, (avg_hr - user.rest_hr) / hr_reserve))
+
+        # Grade multiplier
+        elevation_gain = activity.total_elevation_gain or 0.0
+        distance = activity.distance_km or 1.0
+        vert_gain_ratio = elevation_gain / distance
+        grade_multiplier = 1.0 + (vert_gain_ratio / 500.0)
+        adjusted_intensity = min(1.0, hr_intensity * grade_multiplier)
+
+        # Heat multiplier
+        temp_c = activity.temperature_c or 20.0
+        if temp_c > 28.0:
+            heat_penalty = 1.0 + ((temp_c - 28.0) * 0.015)
+            adjusted_intensity = min(1.0, adjusted_intensity * heat_penalty)
+
+        return round((duration * adjusted_intensity * (adjusted_intensity * 100)) / 60.0, 1)
+    except Exception:
+        return 0.0
+
+def calculate_activity_tss(activity: Activity, user: User) -> float:
+    """Helper alias function to calculate activity TSS."""
+    return compute_grade_adjusted_tss(activity, user)
+
+# ========================================================
+# 🚀 HIGH-PERFORMANCE INCREMENTAL STATE-SPACE UPDATER
+# ========================================================
+def get_fatigue_metrics(db: Session, user_id: int):
+    """Fetches precomputed metrics directly from the User record."""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        return 0.0, 0.0, 0.0, "No Data"
+
+    atl = user.atl or 0.0
+    ctl = user.ctl or 0.0
+    tsb = user.tsb or 0.0
+    state = user.training_phase or "Base"
+
+    if tsb < -20:
+        status = "High Fatigue"
+    elif -20 <= tsb < -5:
+        status = "Optimal Training Stress"
+    elif -5 <= tsb <= 10:
+        status = "Baseline Balanced"
+    else:
+        status = "Fresh / Recovery Zone"
+
+    return atl, ctl, tsb, status
+
+def update_user_fitness_metrics(db: Session, user_id: int, activity_tss: float = 0.0):
+    """Applies incremental training stress updates dynamically via state decay formulas."""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        return
+
+    try:
+        # Time decay constants
+        ctl_decay = math.exp(-1.0 / 42.0)
+        atl_decay = math.exp(-1.0 / 7.0)
+
+        # Decay previous loads
+        current_ctl = (user.ctl or 0.0) * ctl_decay
+        current_atl = (user.atl or 0.0) * atl_decay
+
+        # Apply newly recorded activity stimulus
+        if activity_tss > 0.0:
+            current_ctl += activity_tss * (1.0 - ctl_decay)
+            current_atl += activity_tss * (1.0 - atl_decay)
+
+        # Update and save changes
+        user.ctl = round(current_ctl, 1)
+        user.atl = round(current_atl, 1)
+        user.tsb = round(user.ctl - (user.atl / (user.recovery_velocity or 1.0)), 1)
+
+        db.add(user)
+        db.commit()
+        logger.info(f"💾 Incremental fitness metrics written: CTL={user.ctl}, ATL={user.atl}, TSB={user.tsb}")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Incremental load calculation crashed: {str(e)}")
+
+
+=========================================
+FILE: backend/security/auth.py
+=========================================
+# backend/security/auth.py
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+from backend.database import get_db
+from backend.models import User
+
+# Configuration
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "SUPER_SECRET_COMPROMISED_DEFAULT_KEY_CHANGE_THIS")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440 # 24 Hours
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+class SecurityEngine:
+    @staticmethod
+    def hash_password(password: str) -> str:
+        return pwd_context.hash(password)
+
+    @staticmethod
+    def verify_password(plain_password: str, hashed_password: str) -> bool:
+        return pwd_context.verify(plain_password, hashed_password)
+
+    @staticmethod
+    def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+    @staticmethod
+    def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+        credentials_exception = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id: str = payload.get("sub")
+            if user_id is None:
+                raise credentials_exception
+        except JWTError:
+            raise credentials_exception
+            
+        user = db.query(User).filter_by(id=int(user_id)).first()
+        if user is None:
+            raise credentials_exception
+        return user
+
+class RequireRole:
+    """RBAC Guard middleware for API routing authorization."""
+    def __init__(self, allowed_roles: list):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, current_user: User = Depends(SecurityEngine.get_current_user)):
+        if current_user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your security clearances do not permit access to this resource."
+            )
+        return current_user
+
+
+=========================================
+FILE: backend/security/usage_governance.py
+=========================================
+# backend/security/usage_governance.py
+import logging
+from sqlalchemy.orm import Session
+from backend.models import User
+
+logger = logging.getLogger(__name__)
+
+class UsageGovernor:
+    @staticmethod
+    def is_quota_exceeded(db: Session, user_id: int) -> bool:
+        """Checks if the athlete has exceeded their monthly token allowance."""
+        user = db.query(User).filter_by(id=user_id).first()
+        if not user:
+            return True
+            
+        # Protect against empty quotas
+        quota = user.monthly_token_quota or 500000
+        used = user.monthly_tokens_used or 0
+        
+        if used >= quota:
+            logger.warning(f"🚨 [QUOTA EXCEEDED] User {user_id} blocked. Current usage: {used}/{quota} tokens.")
+            return True
+        return False
+
+    @staticmethod
+    def log_token_usage(db: Session, user_id: int, tokens_consumed: int):
+        """Records token usage and persists the metrics to the database."""
+        try:
+            user = db.query(User).filter_by(id=user_id).first()
+            if user:
+                user.monthly_tokens_used = (user.monthly_tokens_used or 0) + tokens_consumed
+                db.commit()
+                logger.info(f"📊 Tokens logged for User {user_id}: +{tokens_consumed} (Total: {user.monthly_tokens_used})")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Failed to log token usage: {str(e)}")
+
+
+=========================================
+FILE: backend/models.py
+=========================================
+# backend/models.py
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, BigInteger, Text, Boolean, Index
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
+from backend.database import Base
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    telegram_chat_id = Column(String, unique=True, index=True)
+
+    org_id = Column(String(50), nullable=True, index=True)   # SaaS Tenant Separation
+    coach_id = Column(String(50), nullable=True, index=True) # Human Coach RBAC Map
+    role = Column(String(20), default="athlete")             # 'athlete' | 'coach' | 'admin'
+    hashed_password = Column(String(255), nullable=True)     # For dashboard API access
+
+    # Training Stress Metrics (CTL/ATL/TSB)
+    atl = Column(Float, default=0.0)   # Acute Training Load (7-day decay)
+    ctl = Column(Float, default=0.0)   # Chronic Training Load (42-day decay)
+    tsb = Column(Float, default=0.0)   # Training Stress Balance
+
+    # Longitudinal Coefficients
+    recovery_velocity = Column(Float, default=1.0)
+    fatigue_accumulation_rate = Column(Float, default=1.0)
+    aerobic_adaptation_rate = Column(Float, default=1.0)
+    heat_tolerance_index = Column(Float, default=0.5)
+
+    # Periodization Configs
+    training_phase = Column(String(30), default="Base") # 'Base', 'Build', 'Peak', 'Taper'
+    macrocycle_week = Column(Integer, default=1)
+    target_weekly_tss = Column(Float, default=150.0)
+
+    # Profile & Settings
+    email = Column(String, nullable=True, index=True)
+    dob = Column(DateTime, nullable=True)
+    background_bio = Column(String, nullable=True)
+    target_goal = Column(String, nullable=True)
+    onboarding_step = Column(Integer, default=0)
+    coach_persona = Column(String(20), default="veda")
+
+    # Dynamic Twins (JSONB Snapshots)
+    psychological_twin = Column(JSONB, default={
+        "confidence": 0.8, "anxiety": 0.2, "motivation": 0.8,
+        "burnout_risk": 0.05, "adherence_velocity": 1.0, "frustration_index": 0.1
+    })
+    behavioral_twin = Column(JSONB, default={
+        "compliance_rate": 1.0, "skips_easy_runs": False,
+        "runs_easy_too_hard": False, "pacing_discipline": 0.9
+    })
+    physiological_twin = Column(JSONB, default={
+        "threshold_pace": 300, "threshold_hr": 165, "vo2max_estimate": 48.0,
+        "aerobic_drift_velocity": 0.0, "structural_decay_rate": 0.0
+    })
+
+    # Cache Layer
+    precomputed_snapshot = Column(JSONB, nullable=True)
+
+    # Coaching States
+    coaching_state = Column(String(30), default="Active Base")
+
+    # Strava Metadata
+    strava_athlete_id = Column(String, nullable=True)
+    max_hr = Column(Float, default=190.0)
+    rest_hr = Column(Float, default=60.0)
+    medical_insights = Column(Text, nullable=True)
+
+    last_sync_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    # Relationships
+    activities = relationship("Activity", back_populates="user", cascade="all, delete-orphan")
+    memories = relationship("CoachMemory", back_populates="user", cascade="all, delete-orphan")
+    insights = relationship("AthleteInsight", back_populates="user", cascade="all, delete-orphan")
+
+
+class Activity(Base):
+    __tablename__ = "activities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    strava_id = Column(BigInteger, unique=True, index=True)
+
+    name = Column(String)
+    type = Column(String)
+
+    # Kinematics
+    distance_km = Column(Float)
+    moving_time_min = Column(Float)
+    elapsed_time_min = Column(Float, nullable=True)
+    start_date_utc = Column(DateTime, nullable=False)
+
+    # Physiological Telemetry
+    avg_heart_rate = Column(Float, nullable=True)
+    max_heart_rate = Column(Float, nullable=True)
+    avg_cadence = Column(Float, default=170.0)
+    total_elevation_gain = Column(Float, default=0.0)
+    splits = Column(JSONB, default=[])
+
+    # Environmental Metrics
+    temperature_c = Column(Float, nullable=True)
+    humidity = Column(Float, nullable=True)
+    elevation_m = Column(Float, nullable=True)
+    weather_condition = Column(String(50), nullable=True)
+
+    # Perceived Strain
+    perceived_exertion_rpe = Column(Integer, nullable=True)
+    training_stress_score_tss = Column(Float, default=0.0)
+
+    # Sports Science Calculations
+    cardiac_decoupling = Column(Float, default=0.0)
+    cadence_degradation = Column(Float, default=0.0)
+    glycogen_depleted_g = Column(Float, default=0.0)
+    elevation_adjusted_tss = Column(Float, default=0.0)
+
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", back_populates="activities")
+
+
+class CoachMemory(Base):
+    __tablename__ = "coach_memory"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    role = Column(String(20)) # 'user', 'assistant', 'system'
+    content = Column(String)
+    category = Column(String(30), default="general_chat")
+
+    # Native pgvector 1536-dim Embedding Column
+    vector_embedding = Column(Vector(1536), nullable=True)
+    memory_salience = Column(Float, default=1.0)
+
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", back_populates="memories")
+
+
+class AthleteInsight(Base):
+    __tablename__ = "athlete_insights"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    category = Column(String(50), nullable=False)
+    insight_text = Column(String, nullable=False)
+    confidence_score = Column(Float, default=1.0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    last_observed_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", back_populates="insights")
+
+
+class StravaToken(Base):
+    __tablename__ = "strava_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    athlete_id = Column(BigInteger, nullable=True, index=True)
+    access_token = Column(String)
+    refresh_token = Column(String)
+    expires_at = Column(Integer)
+    created_at = Column(DateTime, default=func.now())
+
+
+class DailyReadiness(Base):
+    __tablename__ = "daily_readiness"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    fatigue_score = Column(Float)
+    recovery_score = Column(Float)
+    injury_risk = Column(String)
+    psychological_readiness = Column(Float, default=1.0)
+    created_at = Column(DateTime, default=func.now())
+
+
+# Optimized Database Indices
+Index("idx_activity_user_date", Activity.user_id, Activity.start_date_utc)
+Index("idx_memory_user_category", CoachMemory.user_id, CoachMemory.category)
+Index("idx_insights_user_category", AthleteInsight.user_id, AthleteInsight.category)
+
+
+=========================================
+FILE: backend/coach_memory.py
+=========================================
+import logging
+from sqlalchemy.orm import Session
+
+from backend.models import CoachMemory
+
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# 💾 SAVE MESSAGE
+# =========================
+def save_message(db: Session, user_id: int, role: str, content: str):
+    """
+    Save conversation message to memory
+    role: "user" | "assistant" | "system"
+    """
+    try:
+        memory = CoachMemory(
+            user_id=user_id,
+            role=role,
+            content=content
+        )
+
+        db.add(memory)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        logger.exception("❌ Failed to save message")
+
+
+# =========================
+# 📖 GET RECENT MEMORY
+# =========================
+def get_recent_memory(db: Session, user_id: int, limit: int = 6):
+    """
+    Fetch recent conversation history (latest first)
+    """
+    try:
+        return (
+            db.query(CoachMemory)
+            .filter_by(user_id=user_id)
+            .order_by(CoachMemory.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+    except Exception:
+        logger.exception("❌ Failed to fetch memory")
+        return []
+
+
+# =========================
+# 🧹 CLEAR USER MEMORY (OPTIONAL)
+# =========================
+def clear_memory(db: Session, user_id: int):
+    """
+    Deletes all memory for a user
+    Useful for reset/debug
+    """
+    try:
+        db.query(CoachMemory).filter_by(user_id=user_id).delete()
+        db.commit()
+
+        logger.info(f"🧹 Memory cleared for user {user_id}")
+
+    except Exception:
+        db.rollback()
+        logger.exception("❌ Failed to clear memory")
+
+
+=========================================
+FILE: backend/database.py
+=========================================
+# backend/database.py
+import os
+import logging
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+logger = logging.getLogger(__name__)
+
+# Primary DB for Writes, Replicas for intensive Analytical/Vector Reads
+PRIMARY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/ai_coach")
+REPLICA_DATABASE_URL = os.getenv("REPLICA_DATABASE_URL", PRIMARY_DATABASE_URL)
+
+# Hardened Connection Pooling
+engine = create_engine(
+    PRIMARY_DATABASE_URL,
+    pool_size=20,          # Increase base connections
+    max_overflow=40,       # Allow burst connections under high load
+    pool_recycle=1800,     # Recycle connections every 30 mins to prevent memory leaks
+    pool_timeout=30,       # Fail fast if pool is saturated
+    pool_pre_ping=True     # Actively test connection health before returning it
+)
+
+replica_engine = create_engine(
+    REPLICA_DATABASE_URL,
+    pool_size=20,
+    max_overflow=40,
+    pool_recycle=1800,
+    pool_timeout=30,
+    pool_pre_ping=True
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+ReplicaSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=replica_engine)
+
+Base = declarative_base()
+
+def get_db():
+    """Default transactional database session (Primary - Write)."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_replica_db():
+    """Analytical read-only session (Replica - Reads/Vectors)."""
+    db = ReplicaSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+=========================================
+FILE: backend/athlete_profile.py
+=========================================
+import logging
+from datetime import datetime
+
+from backend.models import User
+from backend.analytics import (
+    get_fatigue_metrics,
+    get_performance_summary,
+    get_recent_form,
+    get_personal_bests
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# 👤 GET ATHLETE CONTEXT
+# =========================
+def get_athlete_context(db, user_id):
+    """
+    Returns a structured athlete profile used by coach_engine
+    """
+
+    user = db.query(User).filter_by(id=user_id).first()
+
+    if not user:
+        return {
+            "name": "Athlete",
+            "profile": "No data available",
+            "fatigue": {},
+            "performance": {},
+            "recent_form": {},
+            "personal_bests": {}
+        }
+
+    # =========================
+    # 🎂 AGE CALCULATION
+    # =========================
+    age = None
+    if user.dob:
+        try:
+            today = datetime.utcnow().date()
+            age = (
+                today.year - user.dob.year
+                - ((today.month, today.day) < (user.dob.month, user.dob.day))
+            )
+        except Exception:
+            age = None
+
+    # =========================
+    # 📊 METRICS
+    # =========================
+    atl, ctl, tsb, fatigue_status = get_fatigue_metrics(db, user_id)
+
+    # =========================
+    # 📈 PERFORMANCE
+    # =========================
+    performance = get_performance_summary(db, user_id)
+    recent_form = get_recent_form(db, user_id)
+    personal_bests = get_personal_bests(db, user_id)
+
+    # =========================
+    # 🧠 PROFILE SUMMARY
+    # =========================
+    profile_text = (
+        f"Name: {user.name}\n"
+        f"Age: {age if age else 'N/A'}\n"
+        f"Goal: {user.target_goal or 'Not defined'}\n"
+        f"Background: {user.background_bio or 'Not provided'}"
+    )
+
+    # =========================
+    # 📦 FINAL CONTEXT
+    # =========================
+    return {
+        "name": user.name or "Athlete",
+
+        "profile": profile_text,
+
+        "fatigue": {
+            "atl": atl,
+            "ctl": ctl,
+            "tsb": tsb,
+            "status": fatigue_status
+        },
+
+        "performance": performance,
+        "recent_form": recent_form,
+        "personal_bests": personal_bests
+    }
+
+
+=========================================
+FILE: backend/athlete_state/predictive_engine.py
+=========================================
+# backend/athlete_state/predictive_engine.py
+import math
+import logging
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+class PredictiveEngine:
+    """
+    Predictive Injury, Burnout, and Plateau Forecasting Engine.
+    Processes multi-factor metrics to flag issues before they manifest physically.
+    """
+
+    @staticmethod
+    def sigmoid(x: float) -> float:
+        """Standard sigmoid activation function."""
+        return 1.0 / (1.0 + math.exp(-x))
+
+    @staticmethod
+    def forecast_risk_profiles(context: dict) -> dict:
+        """
+        Computes training risks dynamically using standard predictive equations.
+        Outputs: 14-day injury risk, 21-day burnout risk, and aerobic plateau probability.
+        """
+        try:
+            # 1. 14-Day Injury Probability (Weighted Logistic Model)
+            acwr = context.get("fatigue_metrics", {}).get("acwr", 1.0)
+            decay = context.get("physiological", {}).get("structural_decay_rate", 0.0)
+            compliance = context.get("behavioral", {}).get("compliance_rate", 1.0)
+
+            # High ACWR spikes, cadence degradation, and compliance errors scale injury risk
+            injury_logit = (
+                (3.5 * (acwr - 1.25)) + 
+                (22.0 * decay) + 
+                (0.5 * (1.0 - compliance)) - 
+                1.8
+            )
+            injury_prob = round(PredictiveEngine.sigmoid(injury_logit), 2)
+
+            # 2. 21-Day Burnout Probability (Weighted Logistic Model)
+            burnout_risk_indicator = context.get("psychological", {}).get("burnout_risk", 0.05)
+            frustration = context.get("psychological", {}).get("frustration_index", 0.1)
+            adherence_velocity = context.get("psychological", {}).get("adherence_velocity", 1.0)
+
+            burnout_logit = (
+                (2.8 * burnout_risk_indicator) + 
+                (1.5 * frustration) - 
+                (2.0 * adherence_velocity) + 
+                0.2
+            )
+            burnout_prob = round(PredictiveEngine.sigmoid(burnout_logit), 2)
+
+            # 3. Aerobic Plateau Risk
+            # Identified when high chronic load (CTL) is accompanied by rising aerobic drift (drift velocity)
+            ctl = context.get("fatigue_metrics", {}).get("ctl", 20.0)
+            drift_velocity = context.get("physiological", {}).get("aerobic_drift_velocity", 0.0)
+
+            plateau_prob = 0.10
+            if ctl > 40.0 and drift_velocity > 0.03:
+                plateau_prob = round(min(0.95, 0.15 + (ctl / 100.0) * (drift_velocity * 10.0)), 2)
+
+            return {
+                "injury_probability_14d": injury_prob,
+                "burnout_probability_21d": burnout_prob,
+                "plateau_risk": plateau_prob
+            }
+
+        except Exception as e:
+            logger.error(f"❌ PredictiveEngine forecasting failed: {str(e)}")
+            return {"injury_probability_14d": 0.10, "burnout_probability_21d": 0.05, "plateau_risk": 0.15}
+
+
+=========================================
+FILE: backend/athlete_state/adaptation_learning.py
+=========================================
+# backend/athlete_state/adaptation_learning.py
+import logging
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+class AdaptationLearning:
+    """
+    Adaptive State-Space learning engine. 
+    Calibrates personalized recovery decay rates and fatigue sensitivity coefficients
+    over time by analyzing workout responses.
+    """
+
+    @staticmethod
+    def update_coefficients(db, user_id: int, latest_activity: Activity):
+        """
+        Updates the user's personalized recovery and fatigue coefficients.
+        Uses a Kalman-style state-space filter: new_coefficient = old * (1 - alpha) + observed * alpha
+        """
+        user = db.query(User).filter_by(id=user_id).first()
+        if not user or not latest_activity:
+            return
+
+        # Alpha determines the rate of learning (0.10 is stable, 0.30+ is aggressive)
+        alpha = 0.10
+
+        try:
+            # 1. Update Personal Recovery Velocity
+            # Compare perceived recovery speed against total cardiovascular stress (TSS)
+            rpe = latest_activity.perceived_exertion_rpe or 5
+            tss = latest_activity.training_stress_score_tss or 30.0
+
+            # Estimate recovery speed: a high RPE for low TSS indicates a slower recovery velocity
+            observed_recovery_velocity = 1.0
+            if tss > 0:
+                stress_effort_ratio = rpe / (tss / 10.0)
+                if stress_effort_ratio > 1.5:
+                    # Slow recovery velocity (higher perceived strain for the load)
+                    observed_recovery_velocity = 0.82
+                elif stress_effort_ratio < 0.8:
+                    # Fast recovery velocity (efficient recovery and low perceived strain)
+                    observed_recovery_velocity = 1.25
+
+            # Apply state-space filter to smooth out sudden anomalies
+            user.recovery_velocity = round((user.recovery_velocity * (1.0 - alpha)) + (observed_recovery_velocity * alpha), 3)
+
+            # 2. Update Personal Fatigue Accumulation Rate (Sensitivity to spikes)
+            # Checked by comparing cadence decay rates against the aerobic drift velocity
+            drift = latest_activity.cardiac_decoupling or 0.0
+            decay = latest_activity.cadence_degradation or 0.0
+
+            observed_fatigue_accumulation_rate = 1.0
+            if drift > 0.08 or decay > 0.05:
+                # Structural fatigue spike detected; indicating high sensitivity to load
+                observed_fatigue_accumulation_rate = 1.35
+            elif drift < 0.02 and decay < 0.01:
+                # High durability; indicating low sensitivity to load
+                observed_fatigue_accumulation_rate = 0.80
+
+            user.fatigue_accumulation_rate = round((user.fatigue_accumulation_rate * (1.0 - alpha)) + (observed_fatigue_accumulation_rate * alpha), 3)
+
+            # 3. Update Heat Tolerance Index
+            temp_c = latest_activity.temperature_c or 20.0
+            if temp_c > 28.0 and latest_activity.avg_heart_rate:
+                # Compare cardiac decoupling during hot workouts to baseline efficiency
+                observed_heat_tolerance = 1.0
+                if drift > 0.06:
+                    # Low heat tolerance: heart rate spiked significantly in the heat
+                    observed_heat_tolerance = 0.35
+                elif drift < 0.03:
+                    # High heat tolerance: cardiovascular efficiency remained stable
+                    observed_heat_tolerance = 0.85
+                
+                user.heat_tolerance_index = round((user.heat_tolerance_index * (1.0 - alpha)) + (observed_heat_tolerance * alpha), 3)
+
+            db.add(user)
+            db.commit()
+            logger.info(f"🧬 Athlete adaptation coefficients updated for User {user_id}: RecVelocity={user.recovery_velocity}, FatigueSensitivity={user.fatigue_accumulation_rate}")
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Adaptation learning failed for user {user_id}: {str(e)}", exc_info=True)
+
+
+=========================================
+FILE: backend/athlete_state/recovery_biomarkers.py
+=========================================
+# backend/athlete_state/recovery_biomarkers.py
+import logging
+
+logger = logging.getLogger(__name__)
+
+class RecoveryBiomarkers:
+    """
+    Multi-Factor Recovery Biomarker Integration Engine.
+    Combines subjective feedback and objective metrics (HRV, RHR, Sleep) to track fatigue.
+    """
+
+    @staticmethod
+    def calculate_recovery_score(
+        hrv_ms: float, 
+        resting_hr: float, 
+        sleep_hours: float, 
+        soreness_score: int, 
+        user_baseline_hrv: float = 60.0,
+        user_baseline_rhr: float = 55.0
+    ) -> dict:
+        """
+        Calculates an objective recovery score.
+        Scores: 0.0 (Severe Exhaustion) to 100.0 (Fully Restored)
+        """
+        try:
+            # 1. HRV Penalty/Bonus (HRV drop indicates autonomic nervous system strain)
+            hrv_ratio = hrv_ms / user_baseline_hrv if user_baseline_hrv > 0 else 1.0
+            hrv_score = 100.0 * hrv_ratio
+            hrv_score = max(0.0, min(100.0, hrv_score))
+
+            # 2. Resting HR Delta Penalty (Elevated RHR indicates physical stress)
+            rhr_delta = resting_hr - user_baseline_rhr
+            rhr_score = 100.0
+            if rhr_delta > 0:
+                rhr_score = max(30.0, 100.0 - (rhr_delta * 4.0))
+
+            # 3. Sleep Volume Score
+            sleep_score = 100.0
+            if sleep_hours < 8.0:
+                sleep_score = max(20.0, 100.0 - ((8.0 - sleep_hours) * 15.0))
+
+            # 4. Soreness Penalty (1-10 Scale)
+            soreness_score_bounded = max(1, min(10, soreness_score))
+            soreness_score_calc = (10 - soreness_score_bounded) * 10.0
+
+            # 5. Weighted Recovery Score Synthesis
+            weighted_score = (
+                (hrv_score * 0.35) + 
+                (rhr_score * 0.25) + 
+                (sleep_score * 0.20) + 
+                (soreness_score_calc * 0.20)
+            )
+            final_score = round(max(10.0, min(100.0, weighted_score)), 1)
+
+            # Determine subjective readiness classification
+            if final_score >= 85.0:
+                readiness_class = "Fully Restored (Ready for High Intensity)"
+            elif final_score >= 65.0:
+                readiness_class = "Baseline Stabilized (Aerobic Volume Permitted)"
+            elif final_score >= 45.0:
+                readiness_class = "Autonomic Strain (Recovery Focus Only)"
+            else:
+                readiness_class = "System Exhausted (Complete Rest Demanded)"
+
+            return {
+                "recovery_score": final_score,
+                "readiness_classification": readiness_class,
+                "biomarker_metrics": {
+                    "hrv_retention": round(hrv_ratio * 100.0, 1),
+                    "rhr_elevation": round(rhr_delta, 1),
+                    "sleep_deficit_hours": round(max(0.0, 8.0 - sleep_hours), 1)
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"❌ RecoveryBiomarkers calculation failed: {str(e)}")
+            return {"recovery_score": 75.0, "readiness_classification": "Baseline Stabilized", "biomarker_metrics": {}}
+
+
+=========================================
+FILE: backend/athlete_state/recovery_engine.py
+=========================================
+# backend/athlete_state/recovery_engine.py
+class RecoveryEngine:
+
+    @staticmethod
+    def calculate(fatigue_score):
+        if fatigue_score < 40:
+            return 45  # Needs serious rest
+        if fatigue_score < 60:
+            return 65  # Light recovery active
+        if fatigue_score < 80:
+            return 80  # Good to go
+        return 92  # Fully restored
+
+
+=========================================
+FILE: backend/athlete_state/compliance_engine.py
+=========================================
+# backend/athlete_state/compliance_engine.py
+import logging
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+class ComplianceEngine:
+    """
+    Adherence and Pacing Discipline Engine.
+    Detects easy-run violations and dynamically adjusts future training loads.
+    """
+
+    @staticmethod
+    def evaluate_workout_compliance(activity: Activity, user: User) -> dict:
+        """
+        Compares actual workout execution metrics against prescriptive session limits.
+        """
+        if not activity or not user:
+            return {"compliance_score": 1.0, "runs_easy_too_hard": False, "pacing_discipline": 1.0}
+
+        try:
+            name_lower = (activity.name or "").lower()
+            is_easy_run = "easy" in name_lower or "recovery" in name_lower or "steady" in name_lower
+
+            runs_easy_too_hard = False
+            pacing_discipline = 1.0
+
+            # 1. Evaluate easy-run compliance (Checking for "easy days run too hard")
+            if is_easy_run and activity.avg_heart_rate and user.max_hr and user.rest_hr:
+                hr_reserve = user.max_hr - user.rest_hr
+                # Easy runs must be kept under 75% of HR reserve
+                easy_hr_ceiling = user.rest_hr + (hr_reserve * 0.75)
+                
+                if activity.avg_heart_rate > easy_hr_ceiling:
+                    runs_easy_too_hard = True
+                    pacing_discipline = 0.45
+                    logger.warning(f"🚨 Easy-run violation detected for User {user.id}. HR exceeded easy ceiling of {easy_hr_ceiling} bpm.")
+
+            # 2. Evaluate volume compliance
+            # Ensure actual duration matches the prescribed target (+/- 15%)
+            actual_duration = activity.moving_time_min or 1.0
+            prescribed_duration = 45.0  # Default baseline target
+            duration_ratio = actual_duration / prescribed_duration
+
+            duration_compliance = 1.0
+            if duration_ratio > 1.25:
+                # Athlete ran too long (volume violation)
+                duration_compliance = 0.70
+            elif duration_ratio < 0.75:
+                # Athlete cut the workout short
+                duration_compliance = 0.65
+
+            compliance_score = round((pacing_discipline * 0.60) + (duration_compliance * 0.40), 2)
+
+            return {
+                "compliance_score": compliance_score,
+                "runs_easy_too_hard": runs_easy_too_hard,
+                "pacing_discipline": round(pacing_discipline, 2)
+            }
+
+        except Exception as e:
+            logger.error(f"❌ ComplianceEngine failed to evaluate workout: {str(e)}")
+            return {"compliance_score": 1.0, "runs_easy_too_hard": False, "pacing_discipline": 1.0}
+
+
+=========================================
+FILE: backend/athlete_state/physiology_engine.py
+=========================================
+# backend/athlete_state/physiology_engine.py
+from statistics import mean
+
+class PhysiologyEngine:
+
+    @staticmethod
+    def calculate_hr_zones(user):
+        max_hr = user.max_hr or 190
+        rest_hr = user.rest_hr or 60
+        reserve = max_hr - rest_hr
+
+        return {
+            "zone1": round(rest_hr + reserve * 0.60),
+            "zone2": round(rest_hr + reserve * 0.70),
+            "zone3": round(rest_hr + reserve * 0.80),
+            "zone4": round(rest_hr + reserve * 0.90),
+            "zone5": max_hr
+        }
+
+    @staticmethod
+    def calculate_efficiency(activity):
+        if not activity.avg_heart_rate or not activity.distance_km:
+            return None
+        # Efficiency = Distance / Avg Heart Rate (Higher index indicates higher fitness efficiency)
+        return round(activity.distance_km / activity.avg_heart_rate, 3)
+
+
+=========================================
+FILE: backend/athlete_state/injury_risk_engine.py
+=========================================
+# backend/athlete_state/injury_risk_engine.py
+class InjuryRiskEngine:
+
+    @staticmethod
+    def evaluate(acwr, fatigue_score):
+        if acwr > 1.5:
+            return "High"  # Training spikes are highly correlated with soft-tissue injury
+        if fatigue_score < 50:
+            return "Moderate"
+        return "Low"
+
+
+=========================================
+FILE: backend/athlete_state/advanced_intelligence.py
+=========================================
+# backend/athlete_state/advanced_intelligence.py
+import math
+import logging
+from typing import Dict, List, Optional
+from datetime import datetime
+from backend.models import User, Activity
+
+logger = logging.getLogger(__name__)
+
+class AdvancedTrainingIntelligence:
+
+    @staticmethod
+    def evaluate_workout_compliance(activity: Activity, user: User, target_hr_ceiling: int, target_duration_min: float) -> dict:
+        """
+        Deep Biomechanical & Physiological Compliance Engine.
+        Analyzes pacing adherence, heart rate decoupling (aerobic drift), and cadence degradation.
+        Returns a detailed compliance score (0.0 to 1.0) and coaching flags.
+        """
+        if not activity or not user:
+            return {"compliance_score": 1.0, "status": "No activity data"}
+
+        penalties = 0.0
+        details = {}
+
+        # 1. Heart Rate Adherence Penalty
+        avg_hr = activity.avg_heart_rate or 0.0
+        if avg_hr > target_hr_ceiling:
+            hr_drift = (avg_hr - target_hr_ceiling) / target_hr_ceiling
+            hr_penalty = min(0.35, hr_drift * 1.5)  # Cap at 35% penalty
+            penalties += hr_penalty
+            details["hr_exceeded_ceiling_by_bpm"] = round(avg_hr - target_hr_ceiling, 1)
+            details["hr_penalty"] = round(hr_penalty, 2)
+
+        # 2. Duration/Volume Adherence Penalty
+        actual_duration = activity.moving_time_min or 0.0
+        if target_duration_min > 0:
+            duration_ratio = actual_duration / target_duration_min
+            if duration_ratio > 1.15: # Too long (Overreaching)
+                dur_penalty = min(0.20, (duration_ratio - 1.15) * 1.0)
+                penalties += dur_penalty
+                details["volume_error"] = "Overreached target distance/duration"
+                details["duration_penalty"] = round(dur_penalty, 2)
+            elif duration_ratio < 0.85: # Too short
+                dur_penalty = min(0.25, (0.85 - duration_ratio) * 1.0)
+                penalties += dur_penalty
+                details["volume_error"] = "Workout terminated significantly early"
+                details["duration_penalty"] = round(dur_penalty, 2)
+
+        # 3. Cadence & Mechanical Collapse check
+        cadence_degradation = activity.cadence_degradation or 0.0
+        if cadence_degradation > 0.06: # Stride collapse > 6%
+            cadence_penalty = min(0.15, (cadence_degradation - 0.06) * 2.0)
+            penalties += cadence_penalty
+            details["mechanical_fatigue"] = "Stride cadence collapsed over final splits"
+            details["cadence_penalty"] = round(cadence_penalty, 2)
+
+        final_score = round(max(0.10, 1.0 - penalties), 2)
+        
+        return {
+            "compliance_score": final_score,
+            "cardiac_decoupling": round(activity.cardiac_decoupling or 0.0, 3),
+            "cadence_degradation": round(cadence_degradation, 3),
+            "assessment_details": details
+        }
+
+    @staticmethod
+    def predict_race_performances(user: User) -> dict:
+        """
+        Calculates projected race finish times across core distances.
+        Uses estimated VO2 Max, Threshold Paces, and current CTL as a capacity scaling factor.
+        Formula: T2 = T1 * (D2 / D1)^1.06 (Riegel's formula) scaled by fatigue-capacity trends.
+        """
+        # Read from cached physiological twin snapshot, fallback to safe defaults
+        phys_twin = user.physiological_twin or {}
+        estimated_vo2 = phys_twin.get("vo2max_estimate", 45.0)
+        
+        # Scaling coefficient based on current training load consistency (CTL)
+        # CTL of 60 indicates fully optimized cardiovascular volume potential
+        ctl_factor = min(1.02, max(0.88, (user.ctl or 30.0) / 60.0))
+
+        # Base reference pace (Threshold Pace in seconds per kilometer)
+        # If not populated, derive from a standard VO2 max lookup approximation
+        base_threshold_pace = phys_twin.get("threshold_pace")
+        if not base_threshold_pace or base_threshold_pace <= 0:
+            base_threshold_pace = int(30000 / estimated_vo2) # Simple VO2 to sec/km conversion
+
+        # 10K Time reference calculation
+        base_10k_time_sec = base_threshold_pace * 10.0 / ctl_factor
+
+        def format_time(seconds: float) -> str:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            if hours > 0:
+                return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+            return f"{minutes:02d}:{secs:02d}"
+
+        # Projected times using customized Riegel scaling exponents
+        predictions = {}
+        distances = {
+            "5K": 5.0,
+            "10K": 10.0,
+            "Half-Marathon": 21.0975,
+            "Marathon": 42.195
+        }
+
+        for distance_name, dist_km in distances.items():
+            # Apply Riegel's scaling: T_target = T_ref * (D_target / D_ref) ^ 1.06
+            predicted_seconds = base_10k_time_sec * math.pow((dist_km / 10.0), 1.06)
+            predictions[distance_name] = format_time(predicted_seconds)
+
+        return {
+            "scaled_vo2max": round(estimated_vo2 * ctl_factor, 1),
+            "estimated_threshold_pace_sec_km": int(base_threshold_pace / ctl_factor),
+            "predictions": predictions
+        }
+
+    @staticmethod
+    def generate_adaptive_macrocycle_plan(user: User, weeks_to_target: int) -> dict:
+        """
+        AI Macrocycle Periodization Engine.
+        Synthesizes an adaptive 16-week periodization matrix customized to the athlete's current CTL and TSB.
+        Outputs structural focus, target mileage ranges, and volume/intensity distribution ratios.
+        """
+        if weeks_to_target <= 0:
+            return {"phase": "Recovery/Transition", "focus": "Absorbing residual training stress. Passive cross-training."}
+
+        current_ctl = user.ctl or 10.0
+        
+        # Base target weekly volume (scaled to match current fitness capabilities safely)
+        baseline_mileage = max(20.0, min(120.0, current_ctl * 0.8))
+
+        # Dynamic target assignment based on macrocycle proximity
+        if weeks_to_target > 12:
+            phase = "Base Conditioning Phase"
+            focus = "Mitochondrial adaptation, capillary density, and joint strength expansion."
+            intensity_split = "85% Aerobic Base (Zone 1/2) | 15% Strides & Speed Play"
+            target_mileage = f"{round(baseline_mileage, 1)} - {round(baseline_mileage * 1.15, 1)} km"
+        elif weeks_to_target > 6:
+            phase = "Build / Threshold Phase"
+            focus = "Lactate clearance thresholds, mechanical efficiency, and sustained tempo expansion."
+            intensity_split = "75% Aerobic Base (Zone 1/2) | 20% Lactate Tempo | 5% Speed Intervals"
+            target_mileage = f"{round(baseline_mileage * 1.1, 1)} - {round(baseline_mileage * 1.25, 1)} km"
+        elif weeks_to_target > 2:
+            phase = "Peak Performance Phase"
+            focus = "Race simulation blocks, maximal oxygen uptake capacity, and mechanical specificity."
+            intensity_split = "70% Aerobic Base | 20% Specific Pace Blocks | 10% High Intensity Vo2"
+            target_mileage = f"{round(baseline_mileage * 1.2, 1)} - {round(baseline_mileage * 1.3, 1)} km"
+        else:
+            phase = "Exponential Taper Phase"
+            focus = "Neuromuscular freshness enhancement while shedding residual training fatigue."
+            intensity_split = "80% Active Recovery (Zone 1) | 20% High-Intensity Race Pace Strides"
+            
+            # Apply volume taper decay curve
+            taper_ratio = math.exp(-0.25 * (3 - weeks_to_target))
+            target_mileage = f"{round(baseline_mileage * max(0.40, taper_ratio), 1)} km"
+
+        return {
+            "macrocycle_week": user.macrocycle_week,
+            "weeks_remaining": weeks_to_target,
+            "periodization_phase": phase,
+            "focus_objective": focus,
+            "target_weekly_volume_range": target_mileage,
+            "polarized_intensity_distribution": intensity_split,
+            "current_tsb_state": round(user.tsb or 0.0, 1)
+        }
+
+
+=========================================
+FILE: backend/athlete_state/fatigue_engine.py
+=========================================
+# backend/athlete_state/fatigue_engine.py
+from datetime import datetime, timedelta
+from backend.models import Activity
+
+class FatigueEngine:
+
+    @staticmethod
+    def calculate(db, user_id):
+        now = datetime.utcnow()
+        acute_start = now - timedelta(days=7)
+        chronic_start = now - timedelta(days=42)
+
+        acute = (
+            db.query(Activity)
+            .filter(
+                Activity.user_id == user_id,
+                Activity.start_date_utc >= acute_start  # ✅ Fixed: Changed start_date_ist to start_date_utc
+            )
+            .all()
+        )
+
+        chronic = (
+            db.query(Activity)
+            .filter(
+                Activity.user_id == user_id,
+                Activity.start_date_utc >= chronic_start  # ✅ Fixed: Changed start_date_ist to start_date_utc
+            )
+            .all()
+        )
+
+        acute_load = sum(a.distance_km or 0 for a in acute)
+        chronic_load = sum(a.distance_km or 0 for a in chronic)
+
+        acwr = 0.0
+        if chronic_load > 0:
+            # ACWR = 7-day average load divided by 42-day average weekly load
+            acwr = acute_load / (chronic_load / 6)
+
+        # Baseline fatigue score (Higher is fresher, lower is more fatigued)
+        fatigue_score = 100
+        if acwr > 1.5:
+            fatigue_score = 40  # Danger zone
+        elif acwr > 1.2:
+            fatigue_score = 60  # Productive stress
+        elif acwr > 1.0:
+            fatigue_score = 75  # Building fitness
+
+        return {
+            "acute_load": round(acute_load, 1),
+            "chronic_load": round(chronic_load, 1),
+            "acwr": round(acwr, 2),
+            "fatigue_score": fatigue_score
+        }
+
+
+=========================================
+FILE: backend/config/logging_config.py
+=========================================
+# backend/config/logging_config.py
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+
+class StructuredJsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_object = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "filename": record.filename,
+            "line_number": record.lineno,
+        }
+        
+        # Capture optional dict variables passed to logger
+        if isinstance(record.msg, dict):
+            log_object.update(record.msg)
+            
+        if record.exc_info:
+            log_object["exception"] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_object)
+
+def setup_production_logging():
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Clean up standard default handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(StructuredJsonFormatter())
+    root_logger.addHandler(console_handler)
+
+
+=========================================
+FILE: backend/config/settings.py
+=========================================
+# backend/config/settings.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr
+
+class Settings(BaseSettings):
+    # App General Config
+    ENVIRONMENT: str = Field(default="production", validation_alias="ENV")
+    PORT: int = 8001
+    ALLOWED_ORIGIN: str = "https://yourcoachingapp.com"
+
+    # Database & Redis Secrets
+    DATABASE_URL: str = Field(..., validation_alias="DATABASE_URL")
+    REDIS_URL: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
+    SENTRY_DSN: str = Field(default="", validation_alias="SENTRY_DSN")
+    # API Keys & Third Party Integrations
+    OPENAI_API_KEY: SecretStr = Field(..., validation_alias="OPENAI_API_KEY")
+    TELEGRAM_BOT_TOKEN: str = Field(..., validation_alias="TELEGRAM_BOT_TOKEN")
+    TELEGRAM_SECRET_TOKEN: str = Field(..., validation_alias="TELEGRAM_SECRET_TOKEN")
+    
+    # Strava OAuth credentials
+    STRAVA_CLIENT_ID: str = Field(..., validation_alias="STRAVA_CLIENT_ID")
+    STRAVA_CLIENT_SECRET: SecretStr = Field(..., validation_alias="STRAVA_CLIENT_SECRET")
+    STRAVA_SIGNING_SECRET: str = Field(..., validation_alias="STRAVA_SIGNING_SECRET")
+
+    # Rate Limiting & Admin Access
+    ADMIN_API_KEY: SecretStr = Field(..., validation_alias="ADMIN_API_KEY")
+    DEFAULT_RATE_LIMIT: str = "60 per minute"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+# Instantiate a centralized singleton
+settings = Settings()
+
+
+=========================================
+FILE: backend/strava_webhooks.py
+=========================================
+import logging
+from fastapi import APIRouter, Request, BackgroundTasks
+
+from backend.strava_manager import strava_manager
+
+router = APIRouter(prefix="/webhook", tags=["strava"])
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# ✅ STRAVA WEBHOOK VALIDATION
+# =========================
+@router.get("/strava")
+async def strava_webhook_validation(request: Request):
+    """
+    Strava subscription verification endpoint
+    """
+    params = request.query_params
+    hub_challenge = params.get("hub.challenge")
+
+    return {"hub.challenge": hub_challenge}
+
+
+# =========================
+# 📡 STRAVA EVENT HANDLER
+# =========================
+@router.post("/strava")
+async def strava_webhook_event(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """
+    Handles Strava webhook events (activity create)
+    """
+    try:
+        data = await request.json()
+
+        logger.info(f"📡 Strava webhook received: {data}")
+
+        # Only process new activities
+        if data.get("aspect_type") == "create" and data.get("object_type") == "activity":
+            athlete_id = data.get("owner_id")
+            activity_id = data.get("object_id")
+
+            if athlete_id and activity_id:
+                # 🔥 Process in background (non-blocking)
+                background_tasks.add_task(
+                    strava_manager.handle_webhook,
+                    athlete_id,
+                    activity_id
+                )
+            else:
+                logger.warning("⚠️ Missing athlete_id or activity_id")
+
+        return {"status": "received"}
+
+    except Exception:
+        logger.exception("❌ Strava webhook processing failed")
+        return {"status": "error"}
+
+
+=========================================
+FILE: backend/main.py
+=========================================
+# backend/main.py
+import os
+import asyncio
+import logging
+import uvicorn
+import time
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Request, Depends
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from dotenv import load_dotenv
+import sentry_sdk
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+# 📦 Configure Structured JSON Logging immediately on application boot
+from backend.config.logging_config import setup_production_logging
+setup_production_logging()
+
+from backend.config.settings import settings
+
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        traces_sample_rate=1.0,
+        profiles_sample_rate=1.0,
+    )
+
+logger = logging.getLogger(__name__)
+
+# =========================
+# 🔹 LOAD ENV
+# =========================
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(base_dir, ".env"))
+
+# =========================
+# 🔹 IMPORT MODULES
+# =========================
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from backend.database import engine, Base, get_db
+from backend.webhook import router as webhook_router
+from backend.user import router as auth_router
+from backend.strava_auth import router as strava_auth_router
+from backend.celery_app import celery_app
+import redis
+import httpx
+
+# =========================
+# 🔹 FASTAPI INIT
+# =========================
+app = FastAPI(
+    title="Veda AI Endurance Coach",
+    description="AI-powered endurance coaching system",
+    version="4.0.0"
+)
+
+# =========================
+# 🔹 CORS (Strict Production Lock)
+# =========================
+PRODUCTION_DOMAIN = os.getenv("ALLOWED_ORIGIN", "https://yourcoachingapp.com")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[PRODUCTION_DOMAIN],  # Explicitly locked domain. No wildcard "*" bypasses allowed.
+    allow_credentials=True,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+)
+
+# =========================
+# 🔹 TEMPLATES
+# =========================
+base_path = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(base_path / "templates"))
+
+# =========================
+# 🚀 STARTUP EVENT
+# =========================
+@app.on_event("startup")
+async def startup_event():
+    logger.info({"event": "app_startup_sequence_initialized"})
+
+    # 1. Warm cache slightly (asynchronously)
+    try:
+        r = redis.Redis.from_url(settings.REDIS_URL, socket_timeout=2)
+        r.ping()
+        logger.info({"event": "redis_dependency_validated", "status": "healthy"})
+    except Exception as e:
+        logger.critical({"event": "redis_dependency_failed", "error": str(e)})
+        # Do not block startup; let health check capture and report failures
+        
+    logger.info({"event": "app_startup_completed", "message": "Ready to receive traffic. Startup sync deferred to Celery Beat."})
+
+
+# =========================
+# 🏠 BASIC ROUTES
+# =========================
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# =========================
+# 🩺 COMPREHENSIVE HEALTH CHECK
+# =========================
+@app.get("/health")
+def health_check(db: Session = Depends(get_db)):
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "postgres": "unhealthy",
+        "redis": "unhealthy",
+        "celery_workers_active": 0,
+        "openai_connection": "unhealthy"
+    }
+    
+    overall_healthy = True
+    
+    # 1. Verify PostgreSQL Connection
+    try:
+        start_time = time.time()
+        db.execute(text("SELECT 1"))
+        health_status["postgres"] = f"healthy (latency: {round((time.time() - start_time) * 1000, 1)}ms)"
+    except Exception as e:
+        health_status["postgres"] = f"unhealthy ({str(e)})"
+        overall_healthy = False
+        
+    # 2. Verify Redis Connection
+    try:
+        r = redis.Redis.from_url(settings.REDIS_URL, socket_timeout=2)
+        start_time = time.time()
+        r.ping()
+        health_status["redis"] = f"healthy (latency: {round((time.time() - start_time) * 1000, 1)}ms)"
+    except Exception as e:
+        health_status["redis"] = f"unhealthy ({str(e)})"
+        overall_healthy = False
+
+    # 3. Check Active Celery Workers
+    try:
+        inspect = celery_app.control.inspect(timeout=1.0)
+        active = inspect.active()
+        if active:
+            health_status["celery_workers_active"] = len(active)
+    except Exception:
+        health_status["celery_workers_active"] = "error reading control structures"
+
+    # 4. Verify OpenAI Connection
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"})
+            if resp.status_code == 200:
+                health_status["openai_connection"] = "healthy"
+            else:
+                health_status["openai_connection"] = f"unhealthy (HTTP {resp.status_code})"
+                overall_healthy = False
+    except Exception as e:
+        health_status["openai_connection"] = f"failed to reach API ({str(e)})"
+        overall_healthy = False
+
+    if not overall_healthy:
+        health_status["status"] = "degraded"
+        
+    return health_status
+
+
+# =========================
+# 🔹 ROUTERS
+# =========================
+from backend.strava_webhooks import router as strava_webhook_router
+
+app.include_router(webhook_router)        # Handles Telegram: /webhook/telegram
+app.include_router(auth_router)           # Handles Local Auth: /auth/register
+app.include_router(strava_auth_router)    # Handles Strava Auth: /auth/callback
+app.include_router(strava_webhook_router) # Handles Strava Webhooks: /webhook/strava
+
+# =========================
+# ▶️ ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8001, reload=True)
+
+
+=========================================
+FILE: backend/orchestration/decision_engine.py
+=========================================
+# backend/orchestration/decision_engine.py
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TrainingPrescriptionEngine:
+    """
+    Olympic Periodization & Workout Prescription Engine.
+    Executes block periodization, polarized models, and fatigue-based workout swaps.
+    """
+
+    @staticmethod
+    def prescribe_polarized_block(user_state: dict) -> dict:
+        """
+        Generates custom workout parameters based on physical load limits
+        and historical training patterns.
+        """
+        phase = user_state.get("training_phase", "Base").lower()
+        tsb = user_state.get("fatigue_metrics", {}).get("tsb", 0.0)
+        goal = user_state.get("goal", "general").lower()
+        
+        # Calculate physiological heart rate boundaries
+        zones = user_state.get("hr_zones", {"zone1": 115, "zone2": 133, "zone3": 152, "zone4": 171, "zone5": 190})
+
+        prescription = {
+            "recommended_workout": "Steady Aerobic Base Run - 45 mins",
+            "target_intensity_zone": 2,
+            "rationale": "Accumulating low-intensity aerobic volume to build mitochondrial capacity."
+        }
+
+        # 1. Base Building Phase (High-volume base runs)
+        if phase == "base":
+            prescription = {
+                "recommended_workout": f"Steady Endurance Run (Zone 2: {zones['zone1']}-{zones['zone2']} bpm) - 60 mins",
+                "target_intensity_zone": 2,
+                "rationale": "Focus on capillary bed development and establishing active volume thresholds."
+            }
+        
+        # 2. Build Phase (Speed Intervals / Lactate Threshold Blocks)
+        elif phase == "build":
+            if tsb >= -5.0:
+                prescription = {
+                    "recommended_workout": f"Lactate Threshold Intervals (3x 2km in Zone 4: {zones['zone3']}-{zones['zone4']} bpm, with 3 min walking recovery)",
+                    "target_intensity_zone": 4,
+                    "rationale": "Structured interval work designed to push anaerobic velocity and lactate tolerance."
+                }
+            else:
+                # Fatigue-Aware Swap: Auto-downgrade target workout if form is poor
+                prescription = {
+                    "recommended_workout": f"Fatigue-Bypassed Recovery Run (Zone 1: Under {zones['zone1']} bpm) - 30 mins",
+                    "target_intensity_zone": 1,
+                    "rationale": "Form is low (TSB < -5). Speed session swapped for active recovery to prevent joint stress."
+                }
+
+        # 3. Peak Phase (Target marathon pacing simulation)
+        elif phase == "peak":
+            prescription = {
+                "recommended_workout": f"Aerobic Threshold Tempo Session (Warmup -> 30 mins steady in Zone 3: {zones['zone2']}-{zones['zone3']} bpm -> Cooldown)",
+                "target_intensity_zone": 3,
+                "rationale": "Simulating marathon-pace energy demands and fuel efficiency targets."
+            }
+
+        # 4. Taper Phase (Exponential volume decay)
+        elif phase == "taper":
+            prescription = {
+                "recommended_workout": f"Short Maintenance Stride Intervals (Zone 4: {zones['zone3']}-{zones['zone4']} bpm) - 25 mins",
+                "target_intensity_zone": 4,
+                "rationale": "Reduce volume while maintaining intensity to peak neuro-muscular freshness."
+            }
+
+        return prescription
+
+
+class ConflictResolutionRouter:
+    """Arbitrates specialist recommendations against predictive injury and burnout risks."""
+    @staticmethod
+    def arbitrate(running_decision: dict, recovery_score: float, predictive_risk: dict) -> dict:
+        action = running_decision.get("recommended_workout")
+        intensity = running_decision.get("target_intensity_zone")
+        override_reason = None
+
+        # Rule 1: High Predictive Injury Risk
+        if predictive_risk.get("injury_probability_14d", 0.0) > 0.65:
+            action = "Complete Active Recovery & Muscle Foam Rolling"
+            intensity = 1
+            override_reason = "14-day injury risk exceeds 65% safety limits. Active intervention applied."
+
+        # Rule 2: Low Recovery Score / Autonomic Nervous System Strain
+        elif recovery_score < 45.0:
+            action = "Bypassed Training Rest Day - Focus on Sleep"
+            intensity = 1
+            override_reason = "Biomarkers indicate autonomic strain (Recovery Score < 45). Session cancelled."
+
+        # Rule 3: Burnout Risk Override
+        elif predictive_risk.get("burnout_probability_21d", 0.0) > 0.65:
+            action = "Low-Impact Active Movement Walk - 30 mins"
+            intensity = 1
+            override_reason = "Cognitive burnout parameters are spiking. Training target set to low-impact."
+
+        return {
+            "final_action": action,
+            "final_intensity_zone": intensity,
+            "is_overridden": override_reason is not None,
+            "override_reason": override_reason
+        }
+
+
+class DecisionEngine:
+    @staticmethod
+    def generate_final_response(context: dict) -> dict:
+        """Coordinates and arbitrates programmatic coaching decisions."""
+        running_resp = TrainingPrescriptionEngine.prescribe_polarized_block(context)
+        
+        arbitration = ConflictResolutionRouter.arbitrate(
+            running_decision=running_resp,
+            recovery_score=context.get("recovery_score", 100.0),
+            predictive_risk=context.get("predictive_risk", {})
+        )
+
+        return {
+            "arbitrated_plan": arbitration,
+            "running_analysis": running_resp
+        }
+
+
+=========================================
+FILE: backend/orchestration/athlete_state_builder.py
+=========================================
+# backend/orchestration/athlete_state_builder.py
+import logging
+from sqlalchemy import desc
+from backend.models import User, Activity, AthleteInsight
+from backend.athlete_state.fatigue_engine import FatigueEngine
+from backend.athlete_state.recovery_engine import RecoveryEngine
+from backend.athlete_state.injury_risk_engine import InjuryRiskEngine
+from backend.athlete_state.physiology_engine import PhysiologyEngine
+
+logger = logging.getLogger(__name__)
+
+class AthleteStateBuilder:
+
+    @staticmethod
+    def build(db, user_id):
+        user = db.query(User).filter_by(id=user_id).first()
+        if not user:
+            raise ValueError(f"User with ID {user_id} not found.")
+
+        # --- 1. COMPILE PHYSIOLOGICAL TWIN ---
+        fatigue = FatigueEngine.calculate(db, user_id)
+        zones = PhysiologyEngine.calculate_hr_zones(user)
+
+        # Retrieve last 10 activities for longitudinal trends
+        recent_activities = (
+            db.query(Activity)
+            .filter_by(user_id=user_id)
+            .order_by(Activity.start_date_utc.desc())
+            .limit(10)
+            .all()
+        )
+
+        current_decoupling = 0.0
+        current_degradation = 0.0
+        current_glycogen = 0.0
+
+        # Longitudinal Trend Arrays
+        decoupling_trend = []
+        degradation_trend = []
+
+        for act in recent_activities:
+            if act.cardiac_decoupling is not None:
+                decoupling_trend.append(act.cardiac_decoupling)
+            if act.cadence_degradation is not None:
+                degradation_trend.append(act.cadence_degradation)
+
+        if recent_activities:
+            latest = recent_activities[0]
+            current_decoupling = latest.cardiac_decoupling or 0.0
+            current_degradation = latest.cadence_degradation or 0.0
+            current_glycogen = latest.glycogen_depleted_g or 0.0
+
+        # Calculate slope of cardiac decoupling over time
+        aerobic_drift_velocity = 0.0
+        if len(decoupling_trend) >= 3:
+            aerobic_drift_velocity = round(decoupling_trend[0] - sum(decoupling_trend) / len(decoupling_trend), 3)
+
+        # Rising structural decay rate indicates mechanical fatigue and joint stress
+        structural_decay_rate = 0.0
+        if len(degradation_trend) >= 3:
+            structural_decay_rate = round(degradation_trend[0] - sum(degradation_trend) / len(degradation_trend), 3)
+
+        physiological_twin = {
+            "threshold_pace": user.physiological_twin.get("threshold_pace", 300),
+            "threshold_hr": user.physiological_twin.get("threshold_hr", 165),
+            "vo2max_estimate": user.physiological_twin.get("vo2max_estimate", 48.0),
+            "aerobic_drift_velocity": aerobic_drift_velocity,
+            "structural_decay_rate": structural_decay_rate
+        }
+
+        # --- 2. COMPILE BEHAVIORAL TWIN ---
+        runs_easy_too_hard = False
+        compliance_check = db.query(Activity).filter_by(user_id=user_id).limit(10).all()
+        if compliance_check:
+            easy_runs = [a for a in compliance_check if "Easy" in (a.name or "")]
+            if easy_runs:
+                hard_easy_runs = [e for e in easy_runs if (e.avg_heart_rate or 0) > (user.rest_hr + (user.max_hr - user.rest_hr) * 0.75)]
+                if len(hard_easy_runs) / len(easy_runs) > 0.35:
+                    runs_easy_too_hard = True
+
+        behavioral_twin = {
+            "compliance_rate": round(user.behavioral_twin.get("compliance_rate", 0.95), 2),
+            "skips_easy_runs": user.behavioral_twin.get("skips_easy_runs", False),
+            "runs_easy_too_hard": runs_easy_too_hard,
+            "heat_sensitivity_index": user.behavioral_twin.get("heat_sensitivity_index", 0.5)
+        }
+
+        # --- 3. COMPILE PSYCHOLOGICAL TWIN (Burnout Trend Engine) ---
+        burnout_risk = 0.05
+        frustration_index = 0.1
+        adherence_velocity = 1.0
+
+        if len(compliance_check) >= 5:
+            missed_runs = [c for c in compliance_check[:5] if (c.moving_time_min or 0) == 0]
+            if len(missed_runs) >= 2:
+                burnout_risk = 0.72  # Motivation decay indicator
+                adherence_velocity = 0.4
+                frustration_index = 0.65
+
+        psychological_twin = {
+            "confidence": user.psychological_twin.get("confidence", 0.8),
+            "anxiety": user.psychological_twin.get("anxiety", 0.2),
+            "motivation": user.psychological_twin.get("motivation", 0.8),
+            "burnout_risk": burnout_risk,
+            "adherence_velocity": adherence_velocity,
+            "frustration_index": frustration_index
+        }
+
+        # --- 4. COGNITIVE RECOVERY METRIC SYNTHESIS ---
+        cardiac_load_penalty = min(30.0, current_decoupling * 100.0)
+        durability_penalty = min(30.0, current_degradation * 100.0)
+        glycogen_depletion_cost = min(20.0, (current_glycogen / 350.0) * 20.0)
+
+        latest_temp = recent_activities[0].temperature_c if recent_activities else 20.0
+        heat_cost_penalty = max(0.0, (latest_temp - 25.0) * 1.5) if latest_temp else 0.0
+
+        raw_recovery = 100.0 - (cardiac_load_penalty + durability_penalty + glycogen_depletion_cost + heat_cost_penalty)
+        recovery_score = float(round(max(30.0, min(100.0, raw_recovery)), 1))
+
+        # --- 5. DETECT PREDICTIVE RISK VALUES ---
+        acwr = fatigue.get("acwr", 1.0)
+        injury_probability_14d = 0.10
+        if acwr > 1.5:
+            injury_probability_14d = 0.68
+        elif acwr > 1.2 or structural_decay_rate > 0.03:
+            injury_probability_14d = 0.42
+
+        burnout_probability_21d = 0.05
+        if burnout_risk > 0.50 or adherence_velocity < 0.60:
+            burnout_probability_21d = 0.67
+
+        plateau_risk = 0.15
+        if aerobic_drift_velocity > 0.04 and user.ctl > 40.0:
+            plateau_risk = 0.51
+
+        predictive_risk = {
+            "injury_probability_14d": injury_probability_14d,
+            "burnout_probability_21d": burnout_probability_21d,
+            "plateau_risk": plateau_risk
+        }
+
+        # --- 6. COMPILE INTEGRATED ATHLETE DIGITAL TWIN ---
+        return {
+            "user_id": user.id,
+            "name": user.name,
+            "goal": user.target_goal or "Sub-4 Marathon",
+            "coaching_state": user.coaching_state or "Active Base",
+            "fatigue_metrics": fatigue,
+            "recovery_score": recovery_score,
+            "hr_zones": zones,
+            "glycogen_depleted_g": current_glycogen,
+            "physiological": physiological_twin,
+            "behavioral": behavioral_twin,
+            "psychological": psychological_twin,
+            "predictive_risk": predictive_risk,
+            "cardiovascular_trends": {
+                "latest_cardiac_decoupling": current_decoupling,
+                "latest_stride_degradation": current_degradation,
+                "elevated_cardiac_cost_detected": current_decoupling > 0.05,
+                "stride_collapse_detected": current_degradation > 0.04
+            }
+        }
+
+
+=========================================
+FILE: backend/orchestration/coach_service.py
+=========================================
+# backend/orchestration/coach_service.py
+import logging
+import json
+import redis
+from sqlalchemy.orm import Session
+from backend.models import User
+from backend.memory.semantic_memory import SemanticMemory
+from backend.orchestration.decision_engine import DecisionEngine
+from backend.config.settings import settings
+
+# 🔐 SECURITY & COST GOVERNANCE IMPORTS
+from backend.security.usage_governance import UsageGovernor
+from backend.llm_fallback_service import llm_router
+
+logger = logging.getLogger(__name__)
+redis_client = redis.Redis.from_url(settings.REDIS_URL)
+
+class CoachService:
+
+    @staticmethod
+    def generate(db: Session, user_id: int, user_input: str = None, activity_data = None) -> str:
+        """
+        Enterprise Orchestration Layer. Includes:
+        - Multi-level Redis Caching
+        - Cost-Governance Intelligent Model Routing
+        - Semantic Vector Long-Term Memory
+        - Pre-flight Token Quota verification & dynamic post-run tracking
+        - Resilient Multi-Provider Fallback Routing (Outage Protection)
+        """
+        try:
+            # ==========================================
+            # 🎟️ 1. PRE-FLIGHT USAGE GOVERNANCE CHECK
+            # ==========================================
+            if UsageGovernor.is_quota_exceeded(db, user_id):
+                return "⚠️ You have reached your coaching limit for this month. Please upgrade your plan to unlock more runs."
+
+            # ==========================================
+            # ⚡ 2. CACHED ATHLETE SNAPSHOT ACCESS
+            # ==========================================
+            redis_key = f"cache:user_snapshot:{user_id}"
+            cached_data = redis_client.get(redis_key)
+
+            if cached_data:
+                snapshot = json.loads(cached_data)
+                logger.info("⚡ Snapshot cache HIT on Redis.")
+            else:
+                user = db.query(User).filter_by(id=user_id).first()
+                if not user:
+                    return "⚠️ Profile connection error."
+
+                # Database fallback & write back to cache
+                from backend.orchestration.athlete_state_builder import AthleteStateBuilder
+                snapshot = AthleteStateBuilder.build(db, user_id)
+                redis_client.setex(redis_key, 1800, json.dumps(snapshot))
+                logger.info("💾 Snapshot cache MISS. Re-built and written.")
+
+            user = db.query(User).filter_by(id=user_id).first()
+
+            # ==========================================
+            # 🧠 3. LONG-TERM VECTOR MEMORY RETRIEVAL
+            # ==========================================
+            lookback_query = user_input or "latest training workload progression and recovery velocity"
+            historical_context = SemanticMemory.retrieve_relevant_athlete_history(db, user_id, lookback_query, limit=3)
+
+            # ==========================================
+            # ⚖️ 4. DECISION ENGINE CO-ORDINATION
+            # ==========================================
+            council_diagnostics = DecisionEngine.generate_final_response(snapshot)
+            arbitrated_plan = council_diagnostics["arbitrated_plan"]
+
+            # ==========================================
+            # 🎭 5. PERSONA TONE MAPPING
+            # ==========================================
+            persona = user.coach_persona or "veda"
+            if persona == "dev":
+                coaching_tone = "PERSONA: Captain Dev. Military drill sergeant, blunt, demanding, strict compliance focus."
+            elif persona == "priya":
+                coaching_tone = "PERSONA: Coach Priya. Empathetic, supportive guide, warm, holistic wellness focus."
+            else:
+                coaching_tone = "PERSONA: Coach Veda. High-performance Olympic sports scientist, highly technical and analytical."
+
+            # ==========================================
+            # 🪙 6. MODEL ROUTING CONFIGURATION (COST CONTROL)
+            # ==========================================
+            target_model = "gpt-4o-mini"
+
+            # Complex sports-science workouts, risk warnings, or overrides route to standard gpt-4o
+            if (
+                activity_data is not None or
+                arbitrated_plan.get("is_overridden") is True or
+                snapshot.get("predictive_risk", {}).get("injury_probability_14d", 0.0) > 0.60
+            ):
+                target_model = "gpt-4o"
+                logger.info(f"🎯 Dynamic Routing: Elevated complexity detected. Model set to {target_model}")
+            else:
+                logger.info(f"🪙 Dynamic Routing: Standard communication. Model set to {target_model}")
+
+            narrator_prompt = f"""
+You are an elite endurance coach executing this profile:
+{coaching_tone}
+
+BIOMETRICS:
+- CTL: {user.ctl} | ATL: {user.atl} | TSB: {user.tsb}
+- Phase: {user.training_phase} (Week {user.macrocycle_week})
+
+SEMANTIC MEMORY:
+{historical_context}
+
+PREDICTIVE RISKS:
+- Injury: {snapshot['predictive_risk']['injury_probability_14d'] * 100}%
+- Burnout: {snapshot['predictive_risk']['burnout_probability_21d'] * 100}%
+
+ARBITRATED PLAN:
+- Workout: {arbitrated_plan['final_action']}
+- Override: {arbitrated_plan['is_overridden']} (Reason: {arbitrated_plan['override_reason']})
+
+RULES:
+1. STRICT BREVITY: Output exactly 3 to 4 technical sentences (under 120 words).
+2. NEVER print technical markers, JSON fields, scores, or AI rules. Speak directly to the athlete.
+"""
+
+            # ==========================================
+            # 📡 7. MULTI-PROVIDER FALLBACK COMPLETION
+            # ==========================================
+            system_instruction = "You are an elite sports coach speaking to your athlete."
+            
+            response = llm_router.generate_completion(
+                system_instruction=system_instruction,
+                prompt=narrator_prompt,
+                target_model=target_model,
+                temperature=0.3
+            )
+
+            # ==========================================
+            # 📈 8. TOKEN ACCOUNTING LOGGING
+            # ==========================================
+            # Approximately 1 token = 4 characters
+            tokens_used = int((len(narrator_prompt) + len(response)) / 4)
+            UsageGovernor.log_token_usage(db, user_id, tokens_used)
+
+            # ==========================================
+            # 💾 9. SEMANTIC CHAT HISTORICAL COMMIT
+            # ==========================================
+            if user_input:
+                SemanticMemory.write_semantic_memory(db, user_id, "user", user_input, "tactical")
+                SemanticMemory.write_semantic_memory(db, user_id, "assistant", response, "tactical")
+
+            return response
+
+        except Exception as e:
+            logger.error(f"❌ CoachService Execution failed: {str(e)}", exc_info=True)
+            return "⚠️ Core coaching systems currently recalibrating. Let's touch base in a moment."
+
+
+=========================================
+FILE: backend/memory/semantic_memory.py
+=========================================
+# backend/memory/semantic_memory.py
+import math
+import logging
+from datetime import datetime
+from sqlalchemy.orm import Session
+from backend.models import CoachMemory
+from backend.llm_service import client
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
+
+class SemanticMemory:
+
+    @staticmethod
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=15),
+        reraise=True
+    )
+    def get_embedding(text: str) -> list:
+        try:
+            response = client.embeddings.create(
+                input=[text.replace("\n", " ")],
+                model="text-embedding-3-small"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.warning(f"⚠️ OpenAI Embedding failed: {str(e)}")
+            raise e
+
+    @staticmethod
+    def write_semantic_memory(db: Session, user_id: int, role: str, content: str, category: str = "general_chat"):
+        try:
+            embedding = SemanticMemory.get_embedding(content)
+            important_keywords = ["injury", "pain", "knee", "ache", "marathon", "goal", "doctor", "dislike", "rest"]
+            salience = 0.5
+            if any(kw in content.lower() for kw in important_keywords):
+                salience = 0.95
+
+            memory = CoachMemory(
+                user_id=user_id,
+                role=role,
+                content=content,
+                category=category,
+                vector_embedding=embedding,
+                memory_salience=salience
+            )
+            db.add(memory)
+            db.commit()
+            logger.info(f"🧠 Native pgvector memory saved for User {user_id}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Failed to write vector memory: {str(e)}")
+
+    @staticmethod
+    def retrieve_relevant_athlete_history(db: Session, user_id: int, query_text: str, limit: int = 3) -> str:
+        """
+        Executes an extremely high-speed, native pgvector cosine distance query
+        directly on PostgreSQL.
+        """
+        try:
+            query_vector = SemanticMemory.get_embedding(query_text)
+            
+            # Using pgvector's native cosine distance operator '<=>' via SQLAlchemy
+            results = (
+                db.query(CoachMemory)
+                .filter(CoachMemory.user_id == user_id)
+                .order_by(CoachMemory.vector_embedding.cosine_distance(query_vector))
+                .limit(limit)
+                .all()
+            )
+
+            if not results:
+                return "No historical pattern memories saved yet."
+
+            formatted_context = []
+            for r in results:
+                formatted_context.append(f"[{r.category.upper()} - {r.created_at.strftime('%Y-%m-%d')}]: {r.content}")
+
+            return "\n".join(formatted_context)
+        except Exception as e:
+            logger.error(f"❌ Native vector retrieval crashed: {str(e)}")
+            return "Historical patterns currently offline."
+
+
+=========================================
+FILE: backend/memory/memory_archiver.py
+=========================================
+# backend/memory/memory_archiver.py
+from datetime import datetime, timedelta
+import logging
+from sqlalchemy.orm import Session
+from backend.models import CoachMemory, AthleteInsight
+from backend.llm_fallback_service import llm_router
+
+logger = logging.getLogger(__name__)
+
+class MemoryArchivalEngine:
+    @staticmethod
+    def compress_old_memories(db: Session, user_id: int):
+        """
+        Compresses chat logs older than 14 days into a single consolidated episodic summary,
+        then removes the old logs to keep the vector database small and fast.
+        """
+        two_weeks_ago = datetime.utcnow() - timedelta(days=14)
+        
+        # Fetch old chat memories
+        old_memories = (
+            db.query(CoachMemory)
+            .filter(
+                CoachMemory.user_id == user_id,
+                CoachMemory.created_at <= two_weeks_ago,
+                CoachMemory.category == "general_chat"
+            )
+            .all()
+        )
+        
+        if len(old_memories) < 15:
+            return # Skip if there aren't enough logs to warrant compression
+
+        # Concatenate chat logs for summarization
+        memory_transcript = "\n".join([f"{m.role.upper()}: {m.content}" for m in old_memories])
+        
+        system_instruction = "You are an Elite Memory Compactor. Analyze the chat transcripts and extract critical athlete traits, injuries, goals, and coaching guidelines."
+        prompt = f"Compact this transcript into exactly 3 bullet points:\n{memory_transcript}"
+        
+        try:
+            # Generate the consolidated summary
+            summary = llm_router.generate_completion(system_instruction, prompt, target_model="gpt-4o-mini")
+            
+            # Save the summarized insight
+            consolidated_insight = AthleteInsight(
+                user_id=user_id,
+                category="archived_episodic_summary",
+                insight_text=summary,
+                confidence_score=0.95
+            )
+            db.add(consolidated_insight)
+            
+            # Delete the detailed raw logs
+            for m in old_memories:
+                db.delete(m)
+                
+            db.commit()
+            logger.info(f"🧹 Compressed and archived {len(old_memories)} old memory logs for User {user_id}")
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Failed to archive and compress memories: {str(e)}")
+
+
+=========================================
+FILE: backend/user.py
+=========================================
+import os
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from datetime import datetime
+from backend.database import get_db
+from backend.models import User
+from dotenv import load_dotenv
+
+load_dotenv()
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+@router.post("/register")
+async def register_user(
+    name: str, 
+    email: str, 
+    telegram_id: str, 
+    db: Session = Depends(get_db)
+):
+    # 1. Check if user already exists
+    existing_user = db.query(User).filter(User.email == email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    try:
+        # 2. Create the new Athlete record in RDS
+        new_user = User(
+           name=name,
+           email=email,
+           telegram_chat_id=int(telegram_id), # Ensure it's an integer
+           created_at=datetime.utcnow(),
+           max_hr=190,
+           rest_hr=60
+        )
+        db.add(new_user)
+        db.commit()
+
+        db.refresh(new_user)
+
+        # 3. Generate the Personalized Strava Auth URL
+        client_id = os.getenv("STRAVA_CLIENT_ID")
+        # Ensure this redirect_uri matches your Strava API Dashboard settings exactly
+        redirect_uri = "http://13.201.88.144:8001/strava/callback"
+        
+        # We pass new_user.id into 'state' so our callback knows who is returning
+        auth_url = (
+            f"https://www.strava.com/oauth/authorize?"
+            f"client_id={client_id}&"
+            f"response_type=code&"
+            f"redirect_uri={redirect_uri}&"
+            f"approval_prompt=force&"
+            f"scope=read,activity:read_all&"
+            f"state={new_user.id}"
+        )
+
+        return {
+            "status": "success",
+            "message": f"Welcome to VedaActive Wellness, {name}!",
+            "athlete_details": {
+                "user_id": new_user.id,
+                "name": new_user.name,
+                "telegram_id": telegram_id
+            },
+            "strava_link": auth_url,
+            "instructions": "Copy the 'strava_link' and send it to the athlete. Once they authorize, their account will be fully linked to their specific ID."
+        }
+
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Registration Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+=========================================
+FILE: backend/communication/proactive_notifications.py
+=========================================
+# backend/communication/proactive_notifications.py
+from backend.notifications import send_telegram_message
+
+class ProactiveNotifier:
+
+    @staticmethod
+    def evaluate(user, athlete_state):
+        alerts = []
+
+        if athlete_state["injury_risk"] == "High":
+            alerts.append(
+                "🚨 *CRITICAL SAFETY WARNING:* Ashok, your training workload is spiking too fast (ACWR is in the danger zone). "
+                "I am preemptively scaling back your training intensity today to avoid a tendon flare-up. Stay safe, let's play the long game."
+            )
+
+        if athlete_state["recovery_score"] < 50:
+            alerts.append(
+                "⚠️ *RECOVERY WARNING:* Your physiological recovery score has dropped below 50%. "
+                "Ensure you prioritize sleep and focus on hydration tonight. Do not attempt hard intervals today."
+            )
+
+        for alert in alerts:
+            try:
+                send_telegram_message(alert, user.telegram_chat_id)
+            except Exception as e:
+                print(f"Failed to send proactive message: {str(e)}")
+
+
+=========================================
+FILE: backend/tasks/__init__.py
+=========================================
+
+
+=========================================
+FILE: backend/tasks/sync_tasks.py
+=========================================
+# Add this task inside backend/tasks/sync_tasks.py
+from backend.celery_app import celery_app
+from backend.database import SessionLocal, get_replica_db
+from backend.models import User, Activity
+from backend.notifications import (
+    send_telegram_message,
+    send_telegram_buttons,
+    send_telegram_url_button
+)
+from backend.orchestration.coach_service import CoachService
+from backend.plan_generator import generate_training_plan
+from backend.pdf_utils import extract_text_from_pdf_bytes
+from backend.llm_service import process_medical_pdf_with_llm
+from backend.analytics import calculate_activity_tss, update_user_fitness_metrics
+from sqlalchemy.exc import IntegrityError
+from dateutil import parser
+import httpx
+
+# Medical emergency detection triggers
+EMERGENCY_TRIGGERS = ["chest pain", "tightness in chest", "shortness of breath", "severe dizziness", "passed out", "unconscious", "heart racing abnormally"]
+
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_durable_webhook_handler")
+def trigger_durable_webhook_handler(body: dict):
+    """
+    SaaS-Grade Durable Webhook Handler.
+    Processes the raw Telegram JSON payload asynchronously within Celery.
+    Prevents thread exhaustion in FastAPI and handles retries gracefully.
+    """
+    db = SessionLocal()
+    try:
+        logger.info({"event": "webhook_processing_started", "payload_keys": list(body.keys())})
+
+        # ==========================================
+        # 🔘 1. HANDLE BUTTON CLICKS (CALLBACK QUERIES)
+        # ==========================================
+        if "callback_query" in body:
+            chat_id = str(body["callback_query"]["message"]["chat"]["id"])
+            data = body["callback_query"]["data"]
+
+            logger.info({"event": "button_clicked", "chat_id": chat_id, "callback_data": data})
+            user = db.query(User).filter_by(telegram_chat_id=chat_id).first()
+
+            if not user:
+                send_telegram_message("⚠️ Registration mismatch. Send /start to begin.", chat_id)
+                return
+
+            if data == "Start Training":
+                send_telegram_message("🏁 Let's begin your training journey! Keep consistency high.", chat_id)
+
+            elif data == "View Plan":
+                plan = generate_training_plan(db, user.id, user.target_goal or "general")
+                send_telegram_message(plan, chat_id)
+
+            elif data == "Sync Activities":
+                send_telegram_message("🔄 Syncing your latest activities...", chat_id)
+                from backend.strava_manager import strava_manager
+                # Since we are inside a sync thread, we can run async under loop
+                import asyncio
+                asyncio.run(strava_manager.sync_recent())
+                send_telegram_message("✅ Sync completed successfully!", chat_id)
+
+            elif data.startswith("PERSONA:"):
+                selected_persona = data.split(":")[1]
+                user.coach_persona = selected_persona
+                db.commit()
+
+                persona_names = {
+                    "veda": "Coach Veda (Olympic Scientist)",
+                    "dev": "Captain Dev (Drill Sergeant)",
+                    "priya": "Coach Priya (Supportive Guide)"
+                }
+                send_telegram_message(f"👤 *Coach Persona Updated:* Active communication style set to *{persona_names[selected_persona]}*.", chat_id)
+
+            elif data.startswith("RPE:"):
+                latest_activity = (
+                    db.query(Activity)
+                    .filter_by(user_id=user.id)
+                    .order_by(Activity.start_date_utc.desc())
+                    .first()
+                )
+
+                if latest_activity:
+                    if "1-3" in data: rpe_val = 3
+                    elif "4-6" in data: rpe_val = 5
+                    elif "7-8" in data: rpe_val = 8
+                    else: rpe_val = 10
+
+                    latest_activity.perceived_exertion_rpe = rpe_val
+                    latest_activity.training_stress_score_tss = calculate_activity_tss(latest_activity, user)
+                    db.commit()
+
+                    update_user_fitness_metrics(db, user.id, latest_activity.training_stress_score_tss)
+                    
+                    send_telegram_message(
+                        f"📝 *Effort Recorded:* Subjective score of {rpe_val}/10 applied to *{latest_activity.name}*.\n\n"
+                        f"Current Form (TSB): *{user.tsb}* | Fatigue (ATL): *{user.atl}*",
+                        chat_id
+                    )
+                else:
+                    send_telegram_message("⚠️ No recent runs found to apply effort score.", chat_id)
+            return
+
+        # ==========================================
+        # 📂 2. FILE AND PDF REPORTS
+        # ==========================================
+        message_data = body.get("message", {})
+        chat_id = str(message_data.get("chat", {}).get("id"))
+        user = db.query(User).filter_by(telegram_chat_id=chat_id).first()
+
+        if "document" in message_data:
+            if not user:
+                send_telegram_message("👋 Welcome to Veda AI! Please register before uploading documents.", chat_id)
+                return
+
+            doc = message_data["document"]
+            mime_type = doc.get("mime_type", "")
+            file_name = doc.get("file_name", "document.pdf")
+
+            if "pdf" not in mime_type.lower() and not file_name.lower().endswith(".pdf"):
+                send_telegram_message("❌ Please upload a valid PDF document.", chat_id)
+                return
+
+            send_telegram_message("⏳ Reading and extracting your medical/fitness report. One moment...", chat_id)
+            file_id = doc["file_id"]
+
+            with httpx.Client() as client_http:
+                info_res = client_http.get(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}")
+                if info_res.status_code != 200:
+                    send_telegram_message("❌ Failed to retrieve file info from Telegram.", chat_id)
+                    return
+
+                file_path = info_res.json().get("result", {}).get("file_path")
+                file_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_path}"
+                file_res = client_http.get(file_url)
+
+                if file_res.status_code != 200:
+                    send_telegram_message("❌ Failed to retrieve file from Telegram servers.", chat_id)
+                    return
+
+                pdf_text = extract_text_from_pdf_bytes(file_res.content)
+                if not pdf_text:
+                    send_telegram_message("❌ Could not extract text from this PDF.", chat_id)
+                    return
+
+                extracted_insights = process_medical_pdf_with_llm(pdf_text, user.name)
+
+                try:
+                    user.medical_insights = extracted_insights
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("❌ Failed to commit medical insights")
+                    send_telegram_message("❌ Database write failure. Please try again.", chat_id)
+                    return
+
+                send_telegram_message(
+                    f"✅ **Medical boundaries successfully updated!**\n\nActive limits stored:\n{extracted_insights}",
+                    chat_id
+                )
+                return
+
+        # ==========================================
+        # 💬 3. TEXT CHATS AND ONBOARDING
+        # ==========================================
+        if "text" not in message_data:
+            return
+
+        text = message_data.get("text", "").strip()
+
+        # Medical Escalation Safety Filter
+        text_lower = text.lower()
+        if any(trigger in text_lower for trigger in EMERGENCY_TRIGGERS):
+            emergency_instructions = (
+                "🚨 *CRITICAL SAFETY WARNING:*\n"
+                "You have reported symptoms indicating acute cardiorespiratory or muscular distress. "
+                "Coaching operations are **SUSPENDED**. Please stop exercising immediately, do not wait for analysis, "
+                "and contact emergency services or consult a cardiologist right away."
+            )
+            send_telegram_message(emergency_instructions, chat_id)
+            return
+
+        # Auto-create user if missing
+        if not user:
+            user = User(name="Athlete", telegram_chat_id=chat_id, onboarding_step=0)
+            try:
+                db.add(user)
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                user = db.query(User).filter_by(telegram_chat_id=chat_id).first()
+
+            send_telegram_message("Welcome to Veda AI! 🏃‍♂️ I'm your coach.\n\nWhat should I call you?", chat_id)
+            return
+
+        logger.info({"event": "text_message_received", "chat_id": chat_id, "step": user.onboarding_step})
+
+        if text.startswith("/start"):
+            step = int(user.onboarding_step)
+            if step == 0:
+                send_telegram_message("Welcome! What should I call you?", chat_id)
+            elif step == 1:
+                send_telegram_message(f"Hi {user.name}, what is your DOB? (YYYY-MM-DD)", chat_id)
+            elif step == 2:
+                send_telegram_message("What is your fitness goal?", chat_id)
+            elif step == 3:
+                send_telegram_message("Tell me about your running background.", chat_id)
+            else:
+                send_telegram_message(f"Welcome back {user.name}! 👋 Ask me anything about your training, or select an option to update your plan.", chat_id)
+            return
+
+        # Onboarding Step 0 -> Name
+        if user.onboarding_step == 0:
+            user.name = text
+            user.onboarding_step = 1
+            db.commit()
+            send_telegram_message(f"Nice to meet you {user.name}! 👋\n\nWhat is your DOB? (YYYY-MM-DD)", chat_id)
+            return
+
+        # Onboarding Step 1 -> DOB
+        elif user.onboarding_step == 1:
+            try:
+                user.dob = parser.parse(text).date()
+                user.onboarding_step = 2
+                db.commit()
+                send_telegram_message("Great! 🎯 What is your fitness goal?", chat_id)
+            except Exception:
+                send_telegram_message("⚠️ Please enter a valid DOB (e.g. 1990-05-21)", chat_id)
+            return
+
+        # Onboarding Step 2 -> Goal
+        elif user.onboarding_step == 2:
+            user.target_goal = text
+            user.onboarding_step = 3
+            db.commit()
+            send_telegram_message("Got it! ⚡ Tell me about your background (e.g. 20km/week)", chat_id)
+            return
+
+        # Onboarding Step 3 -> Background, Disclaimer & Strava Connection
+        elif user.onboarding_step == 3:
+            user.background_bio = text
+            user.onboarding_step = 4
+            db.commit()
+
+            from backend.strava_auth import generate_auth_link
+            auth_url = generate_auth_link(str(chat_id))
+
+            disclaimer = (
+                "⚖️ *Legal Disclaimer:*\n"
+                "Veda OS provides training analysis and fitness load guidance based on mathematical sports-science models. "
+                "It is not a medical diagnostic tool. If you experience persistent pain, chest discomfort, or extreme fatigue, "
+                "pause your training and consult a medical professional immediately.\n\n"
+            )
+
+            send_telegram_message(disclaimer, chat_id)
+            send_telegram_url_button(
+                f"🎉 You're all set, {user.name}!\n\n🧡 Connect your Strava account here:",
+                "Connect Strava",
+                auth_url,
+                chat_id
+            )
+            return
+
+        # Onboarding Step 4+ -> Dynamic Chat Mode
+        else:
+            send_telegram_message("🤖 *Veda Coach is analyzing your metrics...*", chat_id)
+            # Route response generation through our Multi-Agent service
+            response = CoachService.generate(db, user.id, user_input=text)
+            send_telegram_message(response, chat_id)
+
+    except Exception as e:
+        db.rollback()
+        logger.error({"event": "durable_webhook_processing_failed", "error": str(e)}, exc_info=True)
+    finally:
+        db.close()
+
+
+=========================================
+FILE: backend/tasks/coaching_tasks.py
+=========================================
+# backend/tasks/coaching_tasks.py
+import logging
+from backend.celery_app import celery_app
+from backend.database import SessionLocal
+from backend.daily_coach import run_daily_coach
+from backend.orchestration.coach_service import CoachService
+from backend.notifications import send_telegram_message
+
+logger = logging.getLogger(__name__)
+
+@celery_app.task(name="backend.tasks.coaching_tasks.trigger_daily_morning_briefing")
+def trigger_daily_morning_briefing():
+    logger.info("🌅 Celery Worker: Starting daily coaching morning briefings...")
+    try:
+        run_daily_coach()
+        logger.info("✅ Celery Worker: Morning briefing tasks processed successfully.")
+    except Exception as e:
+        logger.error(f"❌ Celery Worker: Morning briefing task failed: {str(e)}", exc_info=True)
+
+
+@celery_app.task(name="backend.tasks.coaching_tasks.generate_async_response")
+def generate_async_response(user_id: int, chat_id: str, user_input: str):
+    """
+    Asynchronously processes the user message through the Multi-Agent council
+    without blocking the FastAPI HTTP connection.
+    """
+    logger.info(f"🧠 Celery Worker: Processing multi-agent synthesis for User ID {user_id}...")
+    db = SessionLocal()
+    try:
+        # 1. Generate the elite response
+        response = CoachService.generate(db, user_id, user_input=user_input)
+
+        # 2. Dispatch message directly to Telegram
+        send_telegram_message(response, chat_id)
+        logger.info(f"✅ Celery Worker: Response dispatched successfully to Chat ID {chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Celery Worker: Async coaching generation failed: {str(e)}", exc_info=True)
+    finally:
+        db.close()
+
+
+# 🧹 Added Task: Weekly Episodic Memory Compression
+@celery_app.task(name="backend.tasks.coaching_tasks.trigger_weekly_compression")
+def trigger_weekly_compression():
+    """
+    Enqueued by Celery Beat every Sunday at midnight.
+    Loops through all registered users and compresses their historical chat vector table.
+    """
+    logger.info("🧹 Celery Worker: Initializing weekly episodic memory compression...")
+    db = SessionLocal()
+    try:
+        from backend.models import User
+        from backend.memory.memory_archiver import MemoryArchivalEngine
+        
+        users = db.query(User).all()
+        for u in users:
+            try:
+                MemoryArchivalEngine.compress_old_memories(db, u.id)
+            except Exception as user_err:
+                logger.error(f"❌ Compression failed for User {u.id}: {str(user_err)}")
+                continue
+        logger.info("✅ Celery Worker: Weekly memory compression completed successfully.")
+    except Exception as e:
+        logger.error(f"❌ Celery Worker: Memory compression task failed: {str(e)}", exc_info=True)
+    finally:
+        db.close()
+
+
+=========================================
+FILE: backend/strava_auth.py
+=========================================
+# backend/strava_auth.py
+import os
+import httpx
+import logging
+from fastapi import APIRouter, Request, Depends, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from sqlalchemy.orm import Session
+
+from backend.database import get_db
+from backend.models import User, StravaToken
+from backend.strava_manager import strava_manager
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+def generate_auth_link(chat_id: str) -> str:
+    client_id = os.getenv("STRAVA_CLIENT_ID")
+    redirect_uri = os.getenv("STRAVA_REDIRECT_URI")
+    return (
+        f"https://www.strava.com/oauth/authorize"
+        f"?client_id={client_id}"
+        f"&response_type=code"
+        f"&redirect_uri={redirect_uri}"
+        f"&approval_prompt=force"
+        f"&scope=read,activity:read_all"
+        f"&state={chat_id}"
+    )
+
+@router.get("/auth/callback", response_class=HTMLResponse)
+async def strava_callback(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    params = request.query_params
+    code = params.get("code")
+    chat_id = params.get("state")
+
+    if not code or not chat_id:
+        return "<h3>Error: Missing verification parameters.</h3>"
+
+    user = db.query(User).filter_by(telegram_chat_id=str(chat_id)).first()
+    if not user:
+        return "<h3>User context not found. Restart via Telegram /start</h3>"
+
+    # Non-blocking async OAuth key exchange
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://www.strava.com/oauth/token",
+            data={
+                "client_id": os.getenv("STRAVA_CLIENT_ID"),
+                "client_secret": os.getenv("STRAVA_CLIENT_SECRET"),
+                "code": code,
+                "grant_type": "authorization_code"
+            }
+        )
+
+    if resp.status_code != 200:
+        return "<h3>Authentication failed with Strava.</h3>"
+
+    data = resp.json()
+    athlete_data = data.get("athlete", {})
+    strava_athlete_id = str(athlete_data.get("id"))
+
+    # Upsert token
+    token_rec = db.query(StravaToken).filter_by(user_id=user.id).first()
+    if not token_rec:
+        token_rec = StravaToken(user_id=user.id)
+        db.add(token_rec)
+
+    token_rec.access_token = data["access_token"]
+    token_rec.refresh_token = data["refresh_token"]
+    token_rec.expires_at = data["expires_at"]
+    token_rec.athlete_id = int(strava_athlete_id)
+
+    user.strava_athlete_id = strava_athlete_id
+    db.commit()
+
+    # Pass to deep sync pipeline safely in the background
+    # ✅ Offload directly to Celery worker queue instantly!
+    from backend.tasks.sync_tasks import trigger_onboarding_backfill
+    trigger_onboarding_backfill.delay(user.id)
+    return f"""
+    <html>
+        <head>
+            <title>Connection Successful</title>
+            <style>
+                body {{ font-family: sans-serif; text-align: center; padding-top: 100px; background-color: #f9fafb; }}
+                .container {{ max-width: 450px; margin: auto; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-top: 5px solid #ff5722; }}
+                h1 {{ color: #ff5722; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>✅ Connection Successful!</h1>
+                <p>Hello {user.name}, your account is fully synced. You can safely close this tab now and return to Telegram.</p>
+            </div>
+        </body>
+    </html>
+    """
+
+
+=========================================
+FILE: backend/whatsapp_service.py
+=========================================
+import os
+from twilio.rest import Client
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Your Twilio credentials from .env
+account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+# Your Twilio WhatsApp Number (usually 'whatsapp:+14155238886' for sandbox)
+from_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER") 
+
+client = Client(account_sid, auth_token)
+
+def send_whatsapp_message(to_phone, message_body):
+    """
+    Sends a WhatsApp message via Twilio.
+    to_phone should be in format '+919652771023'
+    """
+    try:
+        # Twilio requires the 'whatsapp:' prefix
+        to_number = f"whatsapp:{to_phone}" if not to_phone.startswith("whatsapp:") else to_phone
+        
+        message = client.messages.create(
+            body=message_body,
+            from_=from_whatsapp_number,
+            to=to_number
+        )
+        print(f"✅ WhatsApp sent to {to_phone}: {message.sid}")
+        return message.sid
+    except Exception as e:
+        print(f"❌ WhatsApp Error: {e}")
+        return None
+
+
+=========================================
+FILE: backend/daily_coach.py
+=========================================
+# backend/daily_coach.py
+import logging
+
+from backend.database import SessionLocal
+from backend.models import User
+from backend.orchestration.coach_service import CoachService
+from backend.notifications import send_telegram_message
+
+logger = logging.getLogger(__name__)
+
+def run_daily_coach():
+    """
+    Assembles a proactive morning training protocol 
+    sent directly to athletes at 6:00 AM IST.
+    """
+    db = SessionLocal()
+
+    try:
+        users = db.query(User).all()
+        if not users:
+            logger.info("No active users registered for morning briefings.")
+            return
+
+        for user in users:
+            try:
+                if not user.telegram_chat_id:
+                    continue
+
+                # Trigger the multi-agent orchestration service with a directive prompt
+                response = CoachService.generate(
+                    db=db,
+                    user_id=user.id,
+                    user_input="Assess my readiness scores and detail today's precise running instruction."
+                )
+
+                # Broadcast directly to athlete's Telegram handle
+                send_telegram_message(response, user.telegram_chat_id)
+                logger.info(f"🌅 Morning briefing broadcast successfully to user {user.id}")
+
+            except Exception:
+                logger.exception(f"❌ Morning briefing failed for user {user.id}")
+
+    except Exception:
+        logger.exception("❌ Daily briefing pipeline failed.")
+
+    finally:
+        db.close()
+
+
+=========================================
+FILE: backend/ai_agents/running_coach.py
+=========================================
+# backend/ai_agents/running_coach.py
+RUNNING_SYSTEM = """
+You are an elite Olympic-level endurance running coach.
+Analyze the athlete's structural data:
+- ACWR (Acute-to-Chronic Workload Ratio)
+- Core pacing and distance progression
+- Heart Rate zones and efficiency trend
+
+Give a precise running analysis. Focus on workout design, pacing strategies, and volume adaptation.
+Be brief, blunt, and highly technical. No generic fluff.
+"""
+
+def build_prompt(context):
+    return f"ATHLETE CURRENT PROFILE AND WORKLOAD:\n{context}"
+
+
+=========================================
+FILE: backend/ai_agents/recovery_coach.py
+=========================================
+# backend/ai_agents/recovery_coach.py
+RECOVERY_SYSTEM = """
+You are an elite physical therapist and recovery specialist.
+Focus on:
+- Active muscle recovery protocols (foam rolling target zones, myofascial release)
+- Sleep optimization relative to current fatigue scores
+- Autonomic nervous system recovery indicators
+
+Provide a clinical, practical target list for recovery.
+"""
+
+def build_prompt(context):
+    return f"ATHLETE RECOVERY PROFILE:\n{context}"
+
+
+=========================================
+FILE: backend/ai_agents/nutrition_coach.py
+=========================================
+# backend/ai_agents/nutrition_coach.py
+NUTRITION_SYSTEM = """
+You are an elite sports nutritionist working with marathoners aiming for sub-4-hour targets.
+Analyze the training load and provide specific daily fueling requirements:
+- Pre-run glycogen loading suggestions based on upcoming workout intensity
+- Post-run recovery macros (protein, carb ratios)
+- Hydration adjustments based on workout duration
+
+Never say 'eat balanced meals.' Specify carbs in grams per kilogram or exact nutrient timing.
+"""
+
+def build_prompt(context):
+    return f"ATHLETE CURRENT LOAD:\n{context}"
+
+
+=========================================
+FILE: backend/environmental/weather_intelligence.py
+=========================================
+# backend/environmental/weather_intelligence.py
+import logging
+
+logger = logging.getLogger(__name__)
+
+class WeatherIntelligence:
+    """
+    Environmental Stress Analysis Engine.
+    Adjusts pacing and recovery metrics based on weather, AQI, and altitude.
+    """
+
+    @staticmethod
+    def calculate_effective_pacing_penalty(
+        temp_c: float, 
+        humidity: float, 
+        elevation_m: float, 
+        aqi: int = 50
+    ) -> dict:
+        """
+        Calculates pace adjustments (seconds per kilometer) based on environmental stress.
+        """
+        try:
+            pace_adjustment_sec = 0.0
+            cardiac_load_penalty = 1.0
+
+            # 1. Heat and Humidity Stress (Calculates dew point approximation)
+            # A high dew point (> 18°C) impairs the body's ability to cool itself
+            dew_point = temp_c - ((100.0 - humidity) / 5.0)
+            if dew_point > 16.0:
+                # Add 2 seconds per km for every degree above 16°C
+                pace_adjustment_sec += (dew_point - 16.0) * 2.5
+                cardiac_load_penalty += (dew_point - 16.0) * 0.02
+
+            # 2. Altitude Adaptation Penalty (Reduces oxygen availability)
+            if elevation_m > 1000.0:
+                # Every 500m above 1000m altitude adds a 1.5% pacing penalty
+                altitude_offset = (elevation_m - 1000.0) / 500.0
+                pace_adjustment_sec += altitude_offset * 4.0
+                cardiac_load_penalty += altitude_offset * 0.03
+
+            # 3. Air Quality Index (AQI) Safety Boundary
+            aqi_warning = False
+            if aqi > 150:
+                aqi_warning = True
+                # Severe respiratory load penalty
+                pace_adjustment_sec += (aqi - 150) * 0.2
+                cardiac_load_penalty += (aqi - 150) * 0.005
+
+            return {
+                "pace_adjustment_sec_per_km": round(pace_adjustment_sec, 1),
+                "cardiac_load_multiplier": round(cardiac_load_penalty, 3),
+                "unsafe_air_quality_warning": aqi_warning,
+                "dew_point_c": round(dew_point, 1)
+            }
+
+        except Exception as e:
+            logger.error(f"❌ WeatherIntelligence execution failed: {str(e)}")
+            return {"pace_adjustment_sec_per_km": 0.0, "cardiac_load_multiplier": 1.0, "unsafe_air_quality_warning": False, "dew_point_c": 15.0}
+
+
+=========================================
+FILE: backend/webhook.py
+=========================================
+# backend/webhook.py
+import logging
+import os
+from fastapi import APIRouter, Request, Depends, HTTPException, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+from backend.config.settings import settings
+from backend.tasks.sync_tasks import trigger_durable_webhook_handler
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# Initialize Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+
+@router.post("/webhook/telegram")
+@limiter.limit(settings.DEFAULT_RATE_LIMIT)
+async def telegram_webhook(request: Request):
+    """
+    Durable Gateway. Validates payload tokens, immediately schedules a durable
+    Celery task, and returns a 200 ACK back to Telegram instantly.
+    """
+    # 1. Telegram Secret Token Security Check
+    telegram_secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if telegram_secret_header != settings.TELEGRAM_SECRET_TOKEN:
+        logger.warning({
+            "event": "security_violation", 
+            "detail": "Unauthorized Telegram webhook token rejected!"
+        })
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    try:
+        body = await request.json()
+        
+        # 2. Instantly offload execution to Celery queue (guarantees durability even during server restarts)
+        trigger_durable_webhook_handler.delay(body)
+        
+        # 3. Respond with an immediate HTTP 200 OK ACK (Typically <15ms)
+        return {"ok": True}
+        
+    except Exception as e:
+        logger.error({
+            "event": "webhook_dispatch_failed", 
+            "error": str(e)
+        })
+        # Return 200 even on error to stop Telegram from infinite retries or blocking your bot
+        return {"ok": True, "error": "Internal handoff completed"}
+
+
+=========================================
+FILE: backend/llm_fallback_service.py
+=========================================
+# backend/llm_fallback_service.py
+import os
+import logging
+from openai import OpenAI
+import httpx
+
+logger = logging.getLogger(__name__)
+
+class MultiProviderLLMService:
+    def __init__(self):
+        self.openai_key = os.getenv("OPENAI_API_KEY")
+        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        self.gemini_key = os.getenv("GEMINI_API_KEY")
+        
+        self.openai_client = OpenAI(api_key=self.openai_key) if self.openai_key else None
+
+    def generate_completion(self, system_instruction: str, prompt: str, target_model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
+        """Attempts generation with OpenAI, falling back to Anthropic or Gemini on failure."""
+        # 1. Primary Attempt: OpenAI
+        if self.openai_client:
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model=target_model,
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=temperature,
+                    timeout=8.0  # Fail fast to trigger fallback quickly
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"⚠️ OpenAI primary provider failed: {str(e)}. Attempting Anthropic Claude fallback...")
+
+        # 2. Secondary Attempt: Anthropic Claude (via REST API to minimize package overhead)
+        if self.anthropic_key:
+            try:
+                headers = {
+                    "x-api-key": self.anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                }
+                # Map models safely
+                claude_model = "claude-3-5-haiku-20241022" if "mini" in target_model else "claude-3-5-sonnet-20241022"
+                payload = {
+                    "model": claude_model,
+                    "max_tokens": 400,
+                    "temperature": temperature,
+                    "system": system_instruction,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+                with httpx.Client(timeout=8.0) as client:
+                    resp = client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+                    if resp.status_code == 200:
+                        return resp.json()["content"][0]["text"].strip()
+            except Exception as anth_err:
+                logger.error(f"⚠️ Anthropic fallback failed: {str(anth_err)}. Attempting Gemini fallback...")
+
+        # 3. Tertiary Attempt: Google Gemini (via REST API)
+        if self.gemini_key:
+            try:
+                gemini_model = "gemini-1.5-flash" if "mini" in target_model else "gemini-1.5-pro"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={self.gemini_key}"
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": f"System Instructions:\n{system_instruction}\n\nUser Prompt:\n{prompt}"}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": temperature}
+                }
+                with httpx.Client(timeout=8.0) as client:
+                    resp = client.post(url, json=payload)
+                    if resp.status_code == 200:
+                        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except Exception as gem_err:
+                logger.critical(f"🚨 All LLM providers exhausted. Execution failed: {str(gem_err)}")
+                
+        raise RuntimeError("No functional LLM provider available.")
+
+llm_router = MultiProviderLLMService()
+
+
