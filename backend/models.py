@@ -18,6 +18,11 @@ class User(Base):
     role = Column(String(20), default="athlete")             # 'athlete' | 'coach' | 'admin'
     hashed_password = Column(String(255), nullable=True)     # For dashboard API access
 
+    # Subscription & Payment
+    subscription_plan = Column(String(50), nullable=True)    # 'Basic', 'Premium', 'Elite'
+    subscription_expiry = Column(DateTime, nullable=True)
+    payment_status = Column(String(20), default="pending")   # 'pending', 'active', 'expired', 'cancelled'
+
     # Training Stress Metrics (CTL/ATL/TSB)
     atl = Column(Float, default=0.0)   # Acute Training Load (7-day decay)
     ctl = Column(Float, default=0.0)   # Chronic Training Load (42-day decay)
@@ -41,6 +46,10 @@ class User(Base):
     target_goal = Column(String, nullable=True)
     onboarding_step = Column(Integer, default=0)
     coach_persona = Column(String(20), default="veda")
+    timezone = Column(String(50), nullable=True, default="UTC")
+    age = Column(Integer, nullable=True)
+    experience_level = Column(String(30), nullable=True)  # 'Beginner', 'Intermediate', 'Advanced', 'Elite'
+    is_active = Column(Boolean, default=True)
 
     # Dynamic Twins (JSONB Snapshots)
     psychological_twin = Column(JSONB, default={
@@ -70,11 +79,14 @@ class User(Base):
 
     last_sync_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     # Relationships
     activities = relationship("Activity", back_populates="user", cascade="all, delete-orphan")
     memories = relationship("CoachMemory", back_populates="user", cascade="all, delete-orphan")
     insights = relationship("AthleteInsight", back_populates="user", cascade="all, delete-orphan")
+    medical_reports = relationship("MedicalReport", back_populates="user", cascade="all, delete-orphan")
+    performance_metrics = relationship("PerformanceMetric", back_populates="user", cascade="all, delete-orphan")
 
 
 class Activity(Base):
@@ -159,7 +171,7 @@ class StravaToken(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    athlete_id = Column(BigInteger, nullable=True, index=True)
+    strava_athlete_id = Column(BigInteger, nullable=True, index=True)
     access_token = Column(String)
     refresh_token = Column(String)
     expires_at = Column(Integer)
@@ -178,7 +190,129 @@ class DailyReadiness(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class MedicalReport(Base):
+    """Stores uploaded medical reports and extracted parameters"""
+    __tablename__ = "medical_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    file_url = Column(String(500), nullable=True)
+    file_path = Column(String(500), nullable=True)
+    uploaded_at = Column(DateTime, default=func.now())
+    extracted_data = Column(JSONB, default={})  # Extracted parameters from PDF
+    vo2max = Column(Float, nullable=True)
+    lactate_threshold = Column(Float, nullable=True)
+    resting_hr = Column(Float, nullable=True)
+    blood_pressure = Column(String(20), nullable=True)
+    medications = Column(Text, nullable=True)
+    limitations = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship("User", back_populates="medical_reports")
+
+
+class PerformanceMetric(Base):
+    """Daily/Weekly performance aggregates"""
+    __tablename__ = "performance_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    metric_date = Column(DateTime, index=True)
+    period_type = Column(String(20))  # 'daily', 'weekly', 'monthly'
+    
+    weekly_volume_km = Column(Float, default=0.0)
+    weekly_tss = Column(Float, default=0.0)
+    weekly_intensity_factor = Column(Float, default=0.0)
+    avg_hr = Column(Float, nullable=True)
+    avg_pace = Column(Float, nullable=True)
+    
+    form_score = Column(Float, nullable=True)  # -10 to +10
+    fatigue_score = Column(Float, nullable=True)  # 0-100
+    readiness_score = Column(Float, nullable=True)  # 0-100
+    injury_risk_score = Column(Float, nullable=True)  # 0-100
+    
+    peak_power = Column(Integer, nullable=True)  # For cyclists
+    total_workouts = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="performance_metrics")
+
+
+class SubscriptionTier(Base):
+    """Subscription plan tiers"""
+    __tablename__ = "subscription_tiers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), unique=True)  # 'Basic', 'Premium', 'Elite'
+    price_usd = Column(Float)
+    price_inr = Column(Float)
+    features = Column(JSONB, default={})
+    max_athletes = Column(Integer, default=1)
+    created_at = Column(DateTime, default=func.now())
+
+
+class CoachingDecision(Base):
+    """Track coaching recommendations and outcomes"""
+    __tablename__ = "coaching_decisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    decision_type = Column(String(50))  # 'plan_adjustment', 'rest_day', 'hard_effort', etc.
+    recommendation = Column(String(500))
+    user_followed = Column(Boolean, nullable=True)
+    outcome = Column(String(200), nullable=True)
+    effectiveness_score = Column(Float, nullable=True)  # 1-5
+    created_at = Column(DateTime, default=func.now())
+    completed_at = Column(DateTime, nullable=True)
+
+
+class AthleteLearning(Base):
+    """Track learnings about athlete patterns"""
+    __tablename__ = "athlete_learnings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    learning_key = Column(String(100))  # 'prefers_morning_runs', 'responds_to_volume', etc.
+    learning_value = Column(JSONB)
+    confidence_score = Column(Float, default=0.5)  # 0-1
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class InjuryIncident(Base):
+    """Track injury history for prevention"""
+    __tablename__ = "injury_incidents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    injury_type = Column(String(100))
+    severity = Column(String(20))  # 'mild', 'moderate', 'severe'
+    onset_date = Column(DateTime)
+    recovery_date = Column(DateTime, nullable=True)
+    notes = Column(Text, nullable=True)
+    related_activity_id = Column(Integer, ForeignKey("activities.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+
+class PersonalRecord(Base):
+    """Track athlete personal records"""
+    __tablename__ = "personal_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    distance_km = Column(Float)
+    pace_seconds_per_km = Column(Integer)
+    time_seconds = Column(Integer)
+    activity_id = Column(Integer, ForeignKey("activities.id"))
+    race_date = Column(DateTime)
+    created_at = Column(DateTime, default=func.now())
+
+
 # Optimized Database Indices
 Index("idx_activity_user_date", Activity.user_id, Activity.start_date_utc)
 Index("idx_memory_user_category", CoachMemory.user_id, CoachMemory.category)
 Index("idx_insights_user_category", AthleteInsight.user_id, AthleteInsight.category)
+Index("idx_medical_report_user", MedicalReport.user_id)
+Index("idx_performance_metric_user_date", PerformanceMetric.user_id, PerformanceMetric.metric_date)
