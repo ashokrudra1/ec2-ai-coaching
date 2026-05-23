@@ -1,4 +1,5 @@
 # backend/tasks/sync_tasks.py
+import os
 import logging
 import asyncio
 import httpx
@@ -31,8 +32,7 @@ def trigger_onboarding_backfill(user_id: int):
     """
     from backend.strava_manager import strava_manager
     logger.info(f"🏁 Starting onboarding background backfill for User ID {user_id}")
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(strava_manager.backfill(user_id))
+    return asyncio.run(strava_manager.backfill(user_id))
 
 
 @celery_app.task(name="backend.tasks.sync_tasks.trigger_periodic_sync")
@@ -40,8 +40,7 @@ def trigger_periodic_sync():
     """Celery Beat entrypoint to safely synchronize recent training logs."""
     from backend.strava_manager import strava_manager
     logger.info("🔄 Initializing periodic activity synchronization loop...")
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(strava_manager.sync_recent())
+    asyncio.run(strava_manager.sync_recent())
 
 
 @celery_app.task(name="backend.tasks.sync_tasks.trigger_durable_webhook_handler")
@@ -143,14 +142,15 @@ def trigger_durable_webhook_handler(body: dict):
             send_telegram_message("⏳ Reading and extracting your medical/fitness report. One moment...", chat_id)
             file_id = doc["file_id"]
 
+            telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
             with httpx.Client() as client_http:
-                info_res = client_http.get(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}")
+                info_res = client_http.get(f"https://api.telegram.org/bot{telegram_token}/getFile?file_id={file_id}")
                 if info_res.status_code != 200:
                     send_telegram_message("❌ Failed to retrieve file info from Telegram.", chat_id)
                     return
 
                 file_path = info_res.json().get("result", {}).get("file_path")
-                file_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_path}"
+                file_url = f"https://api.telegram.org/file/bot{telegram_token}/{file_path}"
                 file_res = client_http.get(file_url)
 
                 if file_res.status_code != 200:

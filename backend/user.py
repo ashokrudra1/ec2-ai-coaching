@@ -40,7 +40,7 @@ async def register_user(
         # 3. Generate the Personalized Strava Auth URL
         client_id = os.getenv("STRAVA_CLIENT_ID")
         # Ensure this redirect_uri matches your Strava API Dashboard settings exactly
-        redirect_uri = "http://13.201.88.144:8001/strava/callback"
+        redirect_uri = os.getenv("STRAVA_REDIRECT_URI", "http://13.201.88.144:8001/strava/callback")
         
         # We pass new_user.id into 'state' so our callback knows who is returning
         auth_url = (
