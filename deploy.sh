@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# EC2 AUTOMATED DEPLOYMENT SCRIPT
+# EC2 AUTOMATED DEPLOYMENT SCRIPT - FIXED
 # Veda AI Coaching - Complete Setup & Deployment
 ################################################################################
 
@@ -30,7 +30,31 @@ echo -e "${GREEN}✓ System updated${NC}"
 # STEP 2: Install Docker
 ################################################################################
 echo -e "\n${YELLOW}[2/8] Installing Docker...${NC}"
-sudo apt-get install -y -qq docker.io docker-compose-plugin curl git
+
+# Install Docker and dependencies
+sudo apt-get install -y -qq \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    git \
+    gnupg \
+    lsb-release
+
+# Add Docker GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Add Docker repository
+echo \
+  "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker
+sudo apt-get update -qq
+sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io
+
+# Install Docker Compose v2
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
 
 # Start Docker service
 sudo systemctl start docker
@@ -38,6 +62,7 @@ sudo systemctl enable docker
 
 # Add ubuntu user to docker group
 sudo usermod -aG docker ubuntu
+
 echo -e "${GREEN}✓ Docker installed and configured${NC}"
 
 ################################################################################
@@ -121,11 +146,15 @@ fi
 ################################################################################
 echo -e "\n${YELLOW}[6/8] Building Docker images and starting services...${NC}"
 
+# Refresh group membership
+newgrp docker << EOF
 # Build images
 docker compose build --pull
 
 # Start services
 docker compose up -d
+
+EOF
 
 echo -e "${GREEN}✓ Services started${NC}"
 
