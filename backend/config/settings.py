@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     STRAVA_CLIENT_ID: str = Field(..., validation_alias="STRAVA_CLIENT_ID")
     STRAVA_CLIENT_SECRET: SecretStr = Field(..., validation_alias="STRAVA_CLIENT_SECRET")
     STRAVA_SIGNING_SECRET: str = Field(..., validation_alias="STRAVA_SIGNING_SECRET")
+    STRAVA_REDIRECT_URI: str = Field(default="https://vedaactivewellness.xyz/auth/callback", validation_alias="STRAVA_REDIRECT_URI")
 
     # Rate Limiting & Admin Access
     ADMIN_API_KEY: SecretStr = Field(..., validation_alias="ADMIN_API_KEY")

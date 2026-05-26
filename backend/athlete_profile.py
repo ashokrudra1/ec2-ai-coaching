@@ -1,16 +1,11 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from backend.models import User
-from backend.analytics import (
-    get_fatigue_metrics,
-    get_performance_summary,
-    get_recent_form,
-    get_personal_bests
-)
+from backend.analytics import get_fatigue_metrics
+from backend.training_system.metrics_calculator import MetricsCalculator
 
 logger = logging.getLogger(__name__)
-
 
 # =========================
 # 👤 GET ATHLETE CONTEXT
@@ -19,7 +14,6 @@ def get_athlete_context(db, user_id):
     """
     Returns a structured athlete profile used by coach_engine
     """
-
     user = db.query(User).filter_by(id=user_id).first()
 
     if not user:
@@ -38,7 +32,7 @@ def get_athlete_context(db, user_id):
     age = None
     if user.dob:
         try:
-            today = datetime.utcnow().date()
+            today = datetime.now(timezone.utc).date()
             age = (
                 today.year - user.dob.year
                 - ((today.month, today.day) < (user.dob.month, user.dob.day))
@@ -52,11 +46,18 @@ def get_athlete_context(db, user_id):
     atl, ctl, tsb, fatigue_status = get_fatigue_metrics(db, user_id)
 
     # =========================
-    # 📈 PERFORMANCE
+    # 📈 PERFORMANCE & PRs
     # =========================
-    performance = get_performance_summary(db, user_id)
-    recent_form = get_recent_form(db, user_id)
-    personal_bests = get_personal_bests(db, user_id)
+    # Using the standardized MetricsCalculator
+    performance = MetricsCalculator.calculate_weekly_aggregates(db, user_id)
+    personal_bests = MetricsCalculator.calculate_personal_records(db, user_id)
+    
+    # Recent form can be derived from TSB and recent aggregates
+    recent_form = {
+        "tsb": tsb,
+        "status": fatigue_status,
+        "volume_last_7_days": performance.get("volume_km", 0)
+    }
 
     # =========================
     # 🧠 PROFILE SUMMARY
@@ -73,16 +74,13 @@ def get_athlete_context(db, user_id):
     # =========================
     return {
         "name": user.name or "Athlete",
-
         "profile": profile_text,
-
         "fatigue": {
             "atl": atl,
             "ctl": ctl,
             "tsb": tsb,
             "status": fatigue_status
         },
-
         "performance": performance,
         "recent_form": recent_form,
         "personal_bests": personal_bests

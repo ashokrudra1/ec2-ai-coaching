@@ -276,8 +276,9 @@ def trigger_durable_webhook_handler(body: dict):
 
         else:
             send_telegram_message("🤖 *Veda Coach is analyzing your metrics...*", chat_id)
-            response = CoachService.generate(db, user.id, user_input=text)
-            send_telegram_message(response, chat_id)
+            from backend.tasks.coaching_tasks import generate_async_response
+            generate_async_response.delay(user.id, str(chat_id), text)
+            return
 
     except Exception as e:
         db.rollback()

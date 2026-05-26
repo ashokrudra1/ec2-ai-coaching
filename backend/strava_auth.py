@@ -7,13 +7,14 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.models import User, StravaToken
+from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 def generate_auth_link(chat_id: str) -> str:
-    client_id = os.getenv("STRAVA_CLIENT_ID")
-    redirect_uri = os.getenv("STRAVA_REDIRECT_URI")
+    client_id = settings.STRAVA_CLIENT_ID
+    redirect_uri = settings.STRAVA_REDIRECT_URI
     return (
         f"https://www.strava.com/oauth/authorize"
         f"?client_id={client_id}"
@@ -50,8 +51,8 @@ async def strava_callback(request: Request, background_tasks: BackgroundTasks, d
             resp = await client.post(
                 "https://www.strava.com/oauth/token",
                 data={
-                    "client_id": os.getenv("STRAVA_CLIENT_ID"),
-                    "client_secret": os.getenv("STRAVA_CLIENT_SECRET"),
+                    "client_id": settings.STRAVA_CLIENT_ID,
+                    "client_secret": settings.STRAVA_CLIENT_SECRET.get_secret_value(),
                     "code": code,
                     "grant_type": "authorization_code"
                 },

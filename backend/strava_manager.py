@@ -175,8 +175,9 @@ class StravaManager:
             self.bulk_save_activities(db, user.id, [activity])
             saved_act = db.query(Activity).filter_by(strava_id=activity_id).first()
 
-            from backend.analytics import update_user_fitness_metrics
-            update_user_fitness_metrics(db, user.id)
+            from backend.analytics import calculate_activity_tss, update_user_fitness_metrics
+            tss = calculate_activity_tss(saved_act, user)
+            update_user_fitness_metrics(db, user.id, activity_tss=tss)
 
             workout_prompt = f"Analyze my completed workout: {saved_act.name} of {saved_act.distance_km} km. Detail my physiological cardiac cost and recovery priority."
 

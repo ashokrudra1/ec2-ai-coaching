@@ -1,0 +1,49 @@
+vedaactivewellness.xyz {
+    # Reverse proxy backend requests
+    handle /webhook/* {
+        reverse_proxy api:8001
+    }
+    handle /auth/* {
+        reverse_proxy api:8001
+    }
+    handle /strava/* {
+        reverse_proxy api:8001
+    }
+    handle /health {
+        reverse_proxy api:8001
+    }
+    handle /api/* {
+        reverse_proxy api:8001
+    }
+
+    # Everything else goes to the frontend
+    handle {
+        reverse_proxy frontend:3000
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+
+# Add IP-based access for testing
+13.233.127.186 {
+    handle /webhook/* {
+        reverse_proxy api:8001
+    }
+    handle /auth/* {
+        reverse_proxy api:8001
+    }
+    handle /strava/* {
+        reverse_proxy api:8001
+    }
+    handle /health {
+        reverse_proxy api:8001
+    }
+    handle /api/* {
+        reverse_proxy api:8001
+    }
+    handle {
+        reverse_proxy frontend:3000
+    }
+}

@@ -37,21 +37,9 @@ async def register_user(
 
         db.refresh(new_user)
 
-        # 3. Generate the Personalized Strava Auth URL
-        client_id = os.getenv("STRAVA_CLIENT_ID")
-        # Ensure this redirect_uri matches your Strava API Dashboard settings exactly
-        redirect_uri = os.getenv("STRAVA_REDIRECT_URI", "http://13.201.88.144:8001/strava/callback")
-        
-        # We pass new_user.id into 'state' so our callback knows who is returning
-        auth_url = (
-            f"https://www.strava.com/oauth/authorize?"
-            f"client_id={client_id}&"
-            f"response_type=code&"
-            f"redirect_uri={redirect_uri}&"
-            f"approval_prompt=force&"
-            f"scope=read,activity:read_all&"
-            f"state={new_user.id}"
-        )
+        # 3. Generate the Personalized Strava Auth URL using centralized logic
+        from backend.strava_auth import generate_auth_link
+        auth_url = generate_auth_link(str(telegram_id))
 
         return {
             "status": "success",

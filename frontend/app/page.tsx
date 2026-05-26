@@ -31,7 +31,7 @@ export default function DashboardPage() {
   const [stats, setStats] = useState<any>(null);
 
   useEffect(() => {
-    fetch("http://13.233.55.51:8001/api/stats")
+    fetch("/api/stats")
       .then((res) => res.json())
       .then((data) => {
         console.log("API Data:", data);

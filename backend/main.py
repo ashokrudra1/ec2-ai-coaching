@@ -39,12 +39,13 @@ load_dotenv(os.path.join(base_dir, ".env"))
 # =========================
 # 🔹 IMPORT MODULES
 # =========================
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 from backend.database import engine, Base, get_db
 from backend.webhook import router as webhook_router
 from backend.user import router as auth_router
 from backend.strava_auth import router as strava_auth_router
+from backend.models import User, Activity
 from backend.celery_app import celery_app
 import redis
 import httpx
@@ -166,6 +167,61 @@ def health_check(db: Session = Depends(get_db)):
         
     return health_status
 
+# =========================
+# 📊 DASHBOARD API
+# =========================
+@app.get("/api/stats")
+def get_dashboard_stats(db: Session = Depends(get_db)):
+    """Returns aggregate stats for the primary user (mocking for single-user pilot)"""
+    # For now, we fetch stats for the first active user
+    user = db.query(User).filter_by(is_active=True).first()
+    if not user:
+        return {"total_distance": 0, "total_runs": 0, "avg_pace": "0:00"}
+    
+    total_distance = db.query(func.sum(Activity.distance_km)).filter_by(user_id=user.id).scalar() or 0
+    total_runs = db.query(func.count(Activity.id)).filter_by(user_id=user.id).scalar() or 0
+    
+    # Calculate average pace (min/km)
+    total_moving_time = db.query(func.sum(Activity.moving_time_min)).filter_by(user_id=user.id).scalar() or 0
+    if total_distance > 0:
+        avg_pace_raw = total_moving_time / total_distance
+        minutes = int(avg_pace_raw)
+        seconds = int((avg_pace_raw - minutes) * 60)
+        avg_pace = f"{minutes}:{seconds:02d}"
+    else:
+        avg_pace = "0:00"
+
+    return {
+        "total_distance": round(total_distance, 1),
+        "total_runs": total_runs,
+        "avg_pace": avg_pace
+    }
+
+@app.get("/api/activities")
+def get_activities(db: Session = Depends(get_db)):
+    """Returns recent activities for the dashboard"""
+    user = db.query(User).filter_by(is_active=True).first()
+    if not user:
+        return []
+    
+    activities = (
+        db.query(Activity)
+        .filter_by(user_id=user.id)
+        .order_by(Activity.start_date_utc.desc())
+        .limit(10)
+        .all()
+    )
+    
+    return [
+        {
+            "id": a.id,
+            "name": a.name,
+            "distance": round(a.distance_km, 2),
+            "date": a.start_date_utc.strftime("%Y-%m-%d"),
+            "type": a.type
+        }
+        for a in activities
+    ]
 
 # =========================
 # 🔹 ROUTERS

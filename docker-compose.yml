@@ -1,0 +1,134 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      REDIS_URL: ${REDIS_URL}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_SECRET_TOKEN: ${TELEGRAM_SECRET_TOKEN}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET}
+      STRAVA_SIGNING_SECRET: ${STRAVA_SIGNING_SECRET}
+      STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      SENTRY_DSN: ${SENTRY_DSN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: celery -A backend.celery_app worker -Q chat_critical,data_sync,onboarding_heavy,scheduled_reports,celery --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      REDIS_URL: ${REDIS_URL}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_SECRET_TOKEN: ${TELEGRAM_SECRET_TOKEN}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET}
+      STRAVA_SIGNING_SECRET: ${STRAVA_SIGNING_SECRET}
+      STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      SENTRY_DSN: ${SENTRY_DSN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: celery -A backend.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      REDIS_URL: ${REDIS_URL}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_SECRET_TOKEN: ${TELEGRAM_SECRET_TOKEN}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET}
+      STRAVA_SIGNING_SECRET: ${STRAVA_SIGNING_SECRET}
+      STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      SENTRY_DSN: ${SENTRY_DSN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: https://vedaactivewellness.xyz
+      INTERNAL_API_URL: http://api:8001
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - frontend
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
