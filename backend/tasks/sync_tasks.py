@@ -276,9 +276,33 @@ def trigger_durable_webhook_handler(body: dict):
 
         else:
             send_telegram_message("🤖 *Veda Coach is analyzing your metrics...*", chat_id)
-            from backend.tasks.coaching_tasks import generate_async_response
-            generate_async_response.delay(user.id, str(chat_id), text)
-            return
+            
+            # Use new IntelligentCoach system
+            try:
+                from backend.communication.intelligent_coach import IntelligentCoach
+                from backend.communication.memory_pipeline import MemoryPipeline
+                import os
+                
+                coach = IntelligentCoach(os.getenv("OPENAI_API_KEY"))
+                response_dict = coach.generate_response(db, user.id, text)
+                
+                if response_dict.get("success"):
+                    response = response_dict.get("response", "")
+                    
+                    # Store in memory and extract learnings
+                    pipeline = MemoryPipeline(os.getenv("OPENAI_API_KEY"))
+                    pipeline.process_full_exchange(db, user.id, text, response)
+                    
+                    send_telegram_message(response, chat_id)
+                else:
+                    # Fallback to legacy system
+                    response = CoachService.generate(db, user.id, user_input=text)
+                    send_telegram_message(response, chat_id)
+                    
+            except Exception as e:
+                logger.error(f"IntelligentCoach error: {e}, falling back to legacy", exc_info=True)
+                response = CoachService.generate(db, user.id, user_input=text)
+                send_telegram_message(response, chat_id)
 
     except Exception as e:
         db.rollback()
