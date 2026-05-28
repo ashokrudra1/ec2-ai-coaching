@@ -9,13 +9,15 @@ logger = logging.getLogger(__name__)
 class MultiProviderLLMService:
     def __init__(self):
         self.openai_key = os.getenv("OPENAI_API_KEY")
+        self.openai_base_url = os.getenv("OPENAI_BASE_URL")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
         self.gemini_key = os.getenv("GEMINI_API_KEY")
         
-        self.openai_client = OpenAI(api_key=self.openai_key) if self.openai_key else None
+        self.openai_client = OpenAI(api_key=self.openai_key, base_url=self.openai_base_url) if (self.openai_key and self.openai_base_url) else (OpenAI(api_key=self.openai_key) if self.openai_key else None)
 
-    def generate_completion(self, system_instruction: str, prompt: str, target_model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
+    def generate_completion(self, system_instruction: str, prompt: str, target_model: str | None = None, temperature: float = 0.3) -> str:
         """Attempts generation with OpenAI, falling back to Anthropic or Gemini on failure."""
+        target_model = target_model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         # 1. Primary Attempt: OpenAI
         if self.openai_client:
             try:

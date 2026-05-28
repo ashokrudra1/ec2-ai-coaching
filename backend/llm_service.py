@@ -13,7 +13,10 @@ from backend.models import CoachMemory
 # 🔧 INIT
 # =========================
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_api_key = os.getenv("OPENAI_API_KEY")
+_base_url = os.getenv("OPENAI_BASE_URL")
+_default_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+client = OpenAI(api_key=_api_key, base_url=_base_url) if _base_url else OpenAI(api_key=_api_key)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,7 @@ Athlete's Message:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=_default_model,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
@@ -115,7 +118,7 @@ If nothing useful → return NONE
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=_default_model,
             messages=[
                 {"role": "system", "content": "Extract structured athlete insights."},
                 {"role": "user", "content": extraction_prompt}
@@ -184,7 +187,7 @@ RAW REPORT TEXT:
 """
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=_default_model,
             messages=[
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
