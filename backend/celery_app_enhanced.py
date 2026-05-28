@@ -182,6 +182,7 @@ celery_app.conf.task_routes = {
     # Scheduled reports
     'backend.tasks.coaching_tasks.trigger_daily_morning_briefing': {'queue': 'scheduled_reports'},
     'backend.tasks.coaching_tasks.trigger_weekly_compression': {'queue': 'scheduled_reports'},
+    'backend.tasks.coaching_tasks.trigger_proactive_engagement': {'queue': 'scheduled_reports'},
     'backend.tasks.report_tasks.generate_weekly_summary': {'queue': 'scheduled_reports'},
     
     # Data synchronization
@@ -279,6 +280,12 @@ celery_app.conf.beat_schedule = {
     "weekly-memory-compression": {
         "task": "backend.tasks.coaching_tasks.trigger_weekly_compression",
         "schedule": crontab(hour=0, minute=0, day_of_week=0),
+        "options": {"queue": "scheduled_reports"}
+    },
+
+    "proactive-engagement-every-4-hours": {
+        "task": "backend.tasks.coaching_tasks.trigger_proactive_engagement",
+        "schedule": 14400.0,
         "options": {"queue": "scheduled_reports"}
     }
 }

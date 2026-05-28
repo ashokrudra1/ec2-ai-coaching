@@ -56,7 +56,7 @@ def process_strava_webhook_event(athlete_id: int, activity_id: int):
     db = SessionLocal()
     try:
         event_id = f"strava:{athlete_id}:{activity_id}"
-        if not claim_event(db, event_id=event_id, source="strava_webhook", user_id=None):
+        if not claim_event(db, event_id=event_id, source="strava_webhook", user_id=None, strict_mode=True):
             logger.info({"event": "idempotency_duplicate_skipped", "event_id": event_id, "source": "strava_webhook"})
             return {"skipped": True, "reason": "duplicate", "event_id": event_id}
     finally:
@@ -120,7 +120,7 @@ def trigger_durable_webhook_handler(body: dict):
         update_id = body.get("update_id")
         event_id = f"telegram:{update_id}" if update_id is not None else None
         correlation_id = event_id
-        if not claim_event(db, event_id=event_id, source="telegram_webhook", user_id=None):
+        if not claim_event(db, event_id=event_id, source="telegram_webhook", user_id=None, strict_mode=True):
             logger.info({"event": "idempotency_duplicate_skipped", "event_id": event_id, "source": "telegram_webhook"})
             return
 

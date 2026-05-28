@@ -99,6 +99,14 @@ class CoachService:
                 has_high_risk_medical_flags=bool(user.medical_insights),
             )
             safety_decision = PolicyEngine.evaluate(safety_ctx)
+            fatigue_guardrail_active = any(
+                r.rule_id in {"fatigue_critical_tsb", "fatigue_caution_tsb"} for r in (safety_decision.rules_fired or [])
+            )
+            record_counter(
+                "coach.safety.rules_fired.total",
+                value=len(safety_decision.rules_fired or []),
+                user_id=user_id,
+            )
 
             # Preserve legacy fatigue guardrail alerts but have them go through PolicyEngine thresholds.
             if not safety_decision.allow_hard_training and (user.tsb or 0.0) < AthleteMonitoringService.TSB_CRITICAL:
@@ -114,6 +122,7 @@ class CoachService:
 
             # Apply safety decision as a hard post-processor on the deterministic plan.
             if safety_decision.block_coaching:
+                record_counter("coach.safety.blocked", user_id=user_id)
                 return (
                     safety_decision.safety_message
                     or "Coaching is temporarily suspended due to safety rules. Please consult a medical professional."
@@ -127,13 +136,21 @@ class CoachService:
                 existing_reason = arbitrated_plan.get("override_reason") or ""
                 safety_reason = safety_decision.safety_message or "Safety policy limited intensity today."
                 arbitrated_plan["override_reason"] = f"{existing_reason} {safety_reason}".strip()
+                record_counter("coach.plan.safety_override", user_id=user_id)
 
             # ==========================================
             # 🎭 6. PERSONA TONE MAPPING
             # ==========================================
             persona = user.coach_persona or "veda"
+            tone_hint = None
+            for objection in council_diagnostics.get("council", {}).get("objections", []):
+                if objection.get("objection_id") == "tone_hint":
+                    tone_hint = objection.get("metadata", {}).get("tone_style")
+                    break
             if fatigue_guardrail_active:
                 coaching_tone = "PERSONA: Injury-prevention endurance clinician. Calm, firm, safety-first, blocks intensity, explains recovery priority."
+            elif tone_hint == "supportive":
+                coaching_tone = "PERSONA: Supportive performance coach. Empathetic, clear, psychologically safe, with specific next steps."
             elif persona == "dev":
                 coaching_tone = "PERSONA: Captain Dev. Military drill sergeant, blunt, demanding, strict compliance focus."
             elif persona == "priya":
@@ -171,8 +188,8 @@ SEMANTIC MEMORY:
 {historical_context}
 
 PREDICTIVE RISKS:
-- Injury: {snapshot['predictive_risk']['injury_probability_14d'] * 100}%
-- Burnout: {snapshot['predictive_risk']['burnout_probability_21d'] * 100}%
+- Injury: {(snapshot.get('predictive_risk', {}).get('injury_probability_14d', 0.0) * 100)}%
+- Burnout: {(snapshot.get('predictive_risk', {}).get('burnout_probability_21d', 0.0) * 100)}%
 
 ARBITRATED PLAN:
 - Workout: {arbitrated_plan['final_action']}
@@ -195,6 +212,7 @@ RULES:
                 target_model=target_model,
                 temperature=0.3
             )
+            record_counter("coach.llm.call.success", model=target_model, user_id=user_id)
 
             # ==========================================
             # 📈 8. TOKEN ACCOUNTING LOGGING
@@ -276,6 +294,7 @@ RULES:
                 # Trace must never block athlete-facing coaching.
                 logger.exception("Failed to write CoachingDecisionTrace")
                 db.rollback()
+                record_counter("coach.trace.write.error", user_id=user_id)
 
             try:
                 event_bus.publish(
@@ -303,7 +322,7 @@ RULES:
                     )
             except Exception:
                 # Event bus failures must not block coaching.
-                pass
+                record_counter("coach.event_bus.error", user_id=user_id)
 
             # ==========================================
             # 💾 10. SEMANTIC CHAT HISTORICAL COMMIT
@@ -316,4 +335,5 @@ RULES:
 
         except Exception as e:
             logger.error(f"❌ CoachService Execution failed: {str(e)}", exc_info=True)
+            record_counter("coach.generate.error", user_id=user_id)
             return "⚠️ Core coaching systems currently recalibrating. Let's touch base in a moment."

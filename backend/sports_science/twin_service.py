@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.models import Activity, User
 from backend.orchestration.metrics_engine import TrainingMetricsEngine
+from backend.sports_science.adaptation_forecaster import AdaptationForecaster
 from backend.sports_science.state_space import StateSpaceDecayModel, TrainingLoadState
 
 
@@ -90,6 +91,24 @@ class PhysiologyTwinService:
         physiological["biomechanical_risk_proxy"] = cls.compute_biomechanical_risk_proxy(
             cardiac_decoupling=getattr(compliance, "cardiac_decoupling", 0.0) or 0.0,
             avg_cadence=activity.avg_cadence,
+        )
+        forecast = AdaptationForecaster.forecast(
+            tsb=training_load_state.tsb,
+            acwr=training_load_state.acwr,
+            recovery_index=physiological["recovery_index"],
+            cardiac_decoupling=getattr(compliance, "cardiac_decoupling", 0.0) or 0.0,
+        )
+        physiological["adaptation_forecast"] = AdaptationForecaster.summarize_for_trace(forecast)
+        physiological["injury_risk_classification"] = AdaptationForecaster.classify_injury_risk(
+            forecast.injury_probability_14d
+        )
+        # Conservative race projection signal derived from current 5K pace proxy.
+        pace_proxy = float(activity.moving_time_min * 60.0 / max(activity.distance_km or 0.001, 0.001))
+        physiological["race_projection_10k_sec_per_km"] = cls.estimate_race_performance(
+            pace_5k_sec_per_km=pace_proxy,
+            vo2_max_percent=1.0 + max(-0.08, min(0.12, (physiological["adaptation_window_72h"] - 0.5) * 0.2)),
+            ctl_strain_factor=1.0 - max(0.0, min(0.15, abs(training_load_state.tsb) / 100.0)),
+            target_distance_km=10.0,
         )
 
         user.physiological_twin = physiological

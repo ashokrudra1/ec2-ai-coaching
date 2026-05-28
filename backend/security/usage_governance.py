@@ -1,12 +1,18 @@
 # backend/security/usage_governance.py
 import logging
 from typing import Optional
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from backend.models import User, AICostEvent
 
 logger = logging.getLogger(__name__)
 
 class UsageGovernor:
+    MODEL_COST_PER_1K_TOKENS = {
+        "gpt-4o-mini": 0.0003,
+        "gpt-4o": 0.0050,
+    }
+
     @staticmethod
     def is_quota_exceeded(db: Session, user_id: int) -> bool:
         """Checks if the athlete has exceeded their monthly token allowance."""
@@ -50,6 +56,8 @@ class UsageGovernor:
         correlation_id: Optional[str],
     ) -> None:
         try:
+            if cost_usd_estimated is None and tokens_estimated is not None:
+                cost_usd_estimated = UsageGovernor.estimate_cost_usd(tokens_estimated, model)
             row = AICostEvent(
                 user_id=user_id,
                 org_id=org_id,
@@ -65,3 +73,22 @@ class UsageGovernor:
         except Exception:
             db.rollback()
             logger.exception("Failed to write AICostEvent")
+
+    @staticmethod
+    def estimate_cost_usd(tokens_estimated: int, model: Optional[str]) -> float:
+        rate = UsageGovernor.MODEL_COST_PER_1K_TOKENS.get(model or "", 0.001)
+        return round((max(0, int(tokens_estimated or 0)) / 1000.0) * rate, 6)
+
+    @staticmethod
+    def get_org_cost_summary(db: Session, org_id: Optional[str]) -> dict:
+        if not org_id:
+            return {"org_id": None, "tokens": 0, "cost_usd": 0.0}
+        row = (
+            db.query(
+                func.coalesce(func.sum(AICostEvent.tokens_estimated), 0),
+                func.coalesce(func.sum(AICostEvent.cost_usd_estimated), 0.0),
+            )
+            .filter(AICostEvent.org_id == org_id)
+            .first()
+        )
+        return {"org_id": org_id, "tokens": int(row[0] or 0), "cost_usd": round(float(row[1] or 0.0), 6)}

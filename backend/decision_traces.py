@@ -97,3 +97,22 @@ def get_latest_decision_trace(
 
     return _redact_for_athlete(trace)
 
+
+@router.get("/stats/summary")
+def get_decision_trace_summary(
+    user_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CoachingDecisionTrace)
+    if user_id is not None:
+        q = q.filter(CoachingDecisionTrace.user_id == user_id)
+
+    rows = q.order_by(CoachingDecisionTrace.created_at.desc()).limit(1000).all()
+    total = len(rows)
+    overridden = sum(1 for row in rows if bool((row.plan_after_safety or {}).get("is_overridden")))
+    return {
+        "total_traces": total,
+        "overridden_traces": overridden,
+        "override_rate": round((overridden / total), 4) if total else 0.0,
+    }
+

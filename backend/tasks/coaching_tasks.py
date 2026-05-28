@@ -16,7 +16,9 @@ import asyncio
 from backend.celery_app import celery_app
 from backend.database import SessionLocal
 from backend.daily_coach import run_daily_coach
+from backend.models import User
 from backend.orchestration.coach_service import CoachService
+from backend.orchestration.autonomous_planner import AutonomousPlanner
 from backend.notifications import send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -146,5 +148,31 @@ def check_compression_status(user_id: int):
     except Exception as e:
         logger.error(f"❌ Failed to check compression status: {str(e)}")
         return {"user_id": user_id, "error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="backend.tasks.coaching_tasks.trigger_proactive_engagement")
+def trigger_proactive_engagement():
+    """
+    Deterministic proactive athlete nudges based on digital twin signals.
+    """
+    db = SessionLocal()
+    try:
+        users = db.query(User).filter(User.is_active == True).all()
+        sent = 0
+        for user in users:
+            if not user.telegram_chat_id:
+                continue
+            plan = AutonomousPlanner.build_checkin_plan(user)
+            if not plan.should_send:
+                continue
+            send_telegram_message(f"🧭 *Autonomous Coach Check-in*\n\n{plan.message}", user.telegram_chat_id)
+            sent += 1
+        logger.info("Proactive engagement completed; messages_sent=%s users=%s", sent, len(users))
+        return {"messages_sent": sent, "users_scanned": len(users)}
+    except Exception as e:
+        logger.error("❌ Proactive engagement task failed: %s", str(e), exc_info=True)
+        return {"messages_sent": 0, "error": str(e)}
     finally:
         db.close()

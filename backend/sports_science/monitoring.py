@@ -49,6 +49,9 @@ class AthleteMonitoringService:
         )
 
         cls.ensure_fatigue_alert(db, user, state.tsb)
+        biomech = (user.physiological_twin or {}).get("biomechanical_risk_proxy", {})
+        if biomech.get("risk_level") == "high":
+            cls.ensure_biomechanical_alert(db, user, biomech)
 
         try:
             event_bus.publish(
@@ -106,6 +109,30 @@ class AthleteMonitoringService:
                 "Veda is switching you to injury-prevention coaching and will block hard training until recovery improves.",
                 user.telegram_chat_id,
             )
+        return alert
+
+    @classmethod
+    def ensure_biomechanical_alert(cls, db: Session, user: User, biomech: dict) -> Optional[SafetyAlert]:
+        existing = db.query(SafetyAlert).filter(
+            SafetyAlert.user_id == user.id,
+            SafetyAlert.alert_type == "biomechanical_risk",
+            SafetyAlert.is_resolved == False,
+        ).first()
+        if existing:
+            return existing
+
+        alert = SafetyAlert(
+            user_id=user.id,
+            alert_type="biomechanical_risk",
+            severity="warning",
+            message=(
+                "Biomechanical risk proxy is elevated. Reduce pace intensity and prioritize stride stability, "
+                "mobility, and recovery."
+            ),
+            source_metric="biomechanical_risk_proxy",
+            source_value=1.0,
+        )
+        db.add(alert)
         return alert
 
     @staticmethod

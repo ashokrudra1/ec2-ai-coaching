@@ -65,6 +65,8 @@ from backend.user import router as auth_router
 from backend.strava_auth import router as strava_auth_router
 from backend.models import User, Activity
 from backend.celery_app import celery_app
+from backend.observability.metrics import snapshot_metrics
+from backend.security.usage_governance import UsageGovernor
 import redis
 import httpx
 
@@ -394,6 +396,18 @@ def health_check_endpoint(db: Session = Depends(get_db)):
         health_status["status"] = "degraded"
     
     return health_status
+
+
+@app.get("/health/metrics")
+def health_metrics_snapshot():
+    """In-process metrics snapshot for quick operational debugging."""
+    return snapshot_metrics()
+
+
+@app.get("/ops/org-cost/{org_id}")
+def org_cost_summary(org_id: str, db: Session = Depends(get_db)):
+    """Tenant-level spend and token visibility for SaaS operations."""
+    return UsageGovernor.get_org_cost_summary(db, org_id)
 
 # ============================================================================
 # 11. DASHBOARD STATISTICS ENDPOINTS
