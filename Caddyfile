@@ -27,7 +27,7 @@ vedaactivewellness.xyz {
 }
 
 # Add IP-based access for testing
-13.233.127.186 {
+65.0.76.38 {
     handle /webhook/* {
         reverse_proxy api:8001
     }
