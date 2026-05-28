@@ -11,6 +11,7 @@ from dateutil import parser
 
 from backend.database import SessionLocal
 from backend.models import User, Activity, StravaToken
+from backend.orchestration.autonomous_planner import AutonomousPlanner
 from backend.sports_science.monitoring import AthleteMonitoringService
 from backend.sports_science.security_utils import decrypt_client_secret
 
@@ -286,6 +287,9 @@ class StravaManager:
                 from backend.notifications import send_telegram_message, send_telegram_buttons
                 send_telegram_message(f"🏃‍♂️ *New Workout Logged:* {activity.get('name')} ({round(saved_act.distance_km, 2)} km)\n\n{response}", user.telegram_chat_id)
                 send_telegram_buttons(f"How did the effort of *{activity.get('name')}* feel on a scale of 1 (Recovery) to 10 (Max Effort)?", ["RPE: 1-3 (Easy)", "RPE: 4-6 (Moderate)", "RPE: 7-8 (Hard)", "RPE: 9-10 (Max)"], user.telegram_chat_id)
+                intervention_hint = AutonomousPlanner.intervention_hint_from_activity(activity, float(user.tsb or 0.0))
+                if intervention_hint:
+                    send_telegram_message(f"🛡️ *Live Intervention Cue:*\n{intervention_hint}", user.telegram_chat_id)
 
         except httpx.TimeoutException:
             logger.error("Webhook activity fetch timed out for athlete_id=%s activity_id=%s", athlete_id, activity_id)
