@@ -2,13 +2,14 @@
 import os
 import logging
 import asyncio
+import time
 import httpx
 from dateutil import parser
 from sqlalchemy.exc import IntegrityError
 
 from backend.celery_app import celery_app
 from backend.database import SessionLocal
-from backend.models import User, Activity, DailyReadiness
+from backend.models import User, Activity, DailyReadiness, StravaToken
 from backend.notifications import (
     send_telegram_message,
     send_telegram_buttons,
@@ -19,12 +20,18 @@ from backend.plan_generator import generate_training_plan
 from backend.pdf_utils import extract_text_from_pdf_bytes
 from backend.llm_service import process_medical_pdf_with_llm
 from backend.analytics import calculate_activity_tss, update_user_fitness_metrics
+from backend.sports_science.monitoring import AthleteMonitoringService
+from backend.safety.policy_engine import SafetyContext, PolicyEngine
+from backend.events.idempotency import claim_event
+from backend.events.event_bus import event_bus
+from backend.events import domain_events
 
 logger = logging.getLogger(__name__)
 
 EMERGENCY_TRIGGERS = ["chest pain", "tightness in chest", "shortness of breath", "severe dizziness", "passed out", "unconscious", "heart racing abnormally"]
+STRAVA_BACKFILL_REQUEST_DELAY_SECONDS = float(os.getenv("STRAVA_BACKFILL_REQUEST_DELAY_SECONDS", "10"))
 
-@celery_app.task(name="backend.tasks.sync_tasks.trigger_onboarding_backfill")
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_onboarding_backfill", rate_limit=os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/15m"))
 def trigger_onboarding_backfill(user_id: int):
     """
     Executes intensive historical backfill safely inside a worker process 
@@ -35,12 +42,69 @@ def trigger_onboarding_backfill(user_id: int):
     return asyncio.run(strava_manager.backfill(user_id))
 
 
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_rate_limited_backfill_page", rate_limit=os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/15m"))
+def trigger_rate_limited_backfill_page(user_id: int, page: int = 1, per_page: int = 100):
+    from backend.strava_manager import strava_manager
+    safe_per_page = max(1, min(int(per_page or 100), 100))
+    time.sleep(max(0.0, STRAVA_BACKFILL_REQUEST_DELAY_SECONDS))
+    logger.info(f"🏁 Running Strava backfill page {page} for User ID {user_id} with per_page={safe_per_page}")
+    return asyncio.run(strava_manager.backfill(user_id, max_activities_limit=safe_per_page))
+
+
+@celery_app.task(name="backend.tasks.sync_tasks.process_strava_webhook_event", rate_limit="95/15m")
+def process_strava_webhook_event(athlete_id: int, activity_id: int):
+    db = SessionLocal()
+    try:
+        event_id = f"strava:{athlete_id}:{activity_id}"
+        if not claim_event(db, event_id=event_id, source="strava_webhook", user_id=None):
+            logger.info({"event": "idempotency_duplicate_skipped", "event_id": event_id, "source": "strava_webhook"})
+            return {"skipped": True, "reason": "duplicate", "event_id": event_id}
+    finally:
+        db.close()
+
+    resolved_user_id = None
+    db = SessionLocal()
+    try:
+        token = db.query(StravaToken).filter_by(strava_athlete_id=athlete_id).first()
+        if token:
+            resolved_user_id = token.user_id
+    finally:
+        db.close()
+
+    from backend.strava_manager import strava_manager
+    logger.info(
+        "📡 Async Strava webhook processing queued for athlete=%s, activity=%s, resolved_user_id=%s",
+        athlete_id,
+        activity_id,
+        resolved_user_id,
+    )
+    return asyncio.run(strava_manager.handle_webhook(athlete_id, activity_id, user_id=resolved_user_id))
+
+
 @celery_app.task(name="backend.tasks.sync_tasks.trigger_periodic_sync")
 def trigger_periodic_sync():
     """Celery Beat entrypoint to safely synchronize recent training logs."""
     from backend.strava_manager import strava_manager
     logger.info("🔄 Initializing periodic activity synchronization loop...")
     asyncio.run(strava_manager.sync_recent())
+
+
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_snapshot_refresh")
+def trigger_snapshot_refresh():
+    db = SessionLocal()
+    try:
+        from backend.orchestration.athlete_state_builder import AthleteStateBuilder
+        users = db.query(User).filter(User.is_active == True).all()
+        for user in users:
+            AthleteMonitoringService.refresh_user_state(db, user)
+            user.precomputed_snapshot = AthleteStateBuilder.build(db, user.id)
+        db.commit()
+        logger.info(f"✅ Refreshed athlete snapshots for {len(users)} active users")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Snapshot refresh failed: {str(e)}", exc_info=True)
+    finally:
+        db.close()
 
 
 @celery_app.task(name="backend.tasks.sync_tasks.trigger_durable_webhook_handler")
@@ -52,6 +116,13 @@ def trigger_durable_webhook_handler(body: dict):
     db = SessionLocal()
     try:
         logger.info({"event": "webhook_processing_started", "payload_keys": list(body.keys())})
+
+        update_id = body.get("update_id")
+        event_id = f"telegram:{update_id}" if update_id is not None else None
+        correlation_id = event_id
+        if not claim_event(db, event_id=event_id, source="telegram_webhook", user_id=None):
+            logger.info({"event": "idempotency_duplicate_skipped", "event_id": event_id, "source": "telegram_webhook"})
+            return
 
         # ==========================================
         # 🔘 HANDLE BUTTON CLICKS (CALLBACK QUERIES)
@@ -189,12 +260,34 @@ def trigger_durable_webhook_handler(body: dict):
 
         text_lower = text.lower()
         if any(trigger in text_lower for trigger in EMERGENCY_TRIGGERS):
+            # Route emergency detection through the central PolicyEngine so that
+            # all hard-stop rules are evaluated consistently.
+            safety_ctx = SafetyContext(
+                user_id=user.id if user else None,
+                emergency_triggered=True,
+            )
+            safety_decision = PolicyEngine.evaluate(safety_ctx)
+
+            try:
+                event_bus.publish(
+                    domain_events.emergency_condition_detected(
+                        event_id=f"emergency:{chat_id}:{update_id or 'na'}",
+                        user_id=user.id if user else None,
+                        payload={"chat_id": chat_id, "update_id": update_id},
+                    )
+                )
+            except Exception:
+                logger.exception("Failed publishing emergency event")
+
             emergency_instructions = (
                 "🚨 *CRITICAL SAFETY WARNING:*\n"
                 "You have reported symptoms indicating acute cardiorespiratory or muscular distress. "
                 "Coaching operations are **SUSPENDED**. Please stop exercising immediately, do not wait for analysis, "
                 "and contact emergency services or consult a cardiologist right away."
             )
+            if safety_decision.safety_message:
+                emergency_instructions += f"\n\n_{safety_decision.safety_message}_"
+
             send_telegram_message(emergency_instructions, chat_id)
             return
 
@@ -256,7 +349,7 @@ def trigger_durable_webhook_handler(body: dict):
             db.commit()
 
             from backend.strava_auth import generate_auth_link
-            auth_url = generate_auth_link(str(chat_id))
+            auth_url, _ = generate_auth_link(str(chat_id), db=db)  # Returns tuple (url, code_verifier)
 
             disclaimer = (
                 "⚖️ *Legal Disclaimer:*\n"
@@ -296,12 +389,26 @@ def trigger_durable_webhook_handler(body: dict):
                     send_telegram_message(response, chat_id)
                 else:
                     # Fallback to legacy system
-                    response = CoachService.generate(db, user.id, user_input=text)
+                    response = CoachService.generate(
+                        db,
+                        user.id,
+                        user_input=text,
+                        trigger_type="chat",
+                        input_event_id=event_id,
+                        correlation_id=correlation_id,
+                    )
                     send_telegram_message(response, chat_id)
                     
             except Exception as e:
                 logger.error(f"IntelligentCoach error: {e}, falling back to legacy", exc_info=True)
-                response = CoachService.generate(db, user.id, user_input=text)
+                response = CoachService.generate(
+                    db,
+                    user.id,
+                    user_input=text,
+                    trigger_type="chat",
+                    input_event_id=event_id,
+                    correlation_id=correlation_id,
+                )
                 send_telegram_message(response, chat_id)
 
     except Exception as e:

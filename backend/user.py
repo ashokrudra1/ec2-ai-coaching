@@ -39,7 +39,7 @@ async def register_user(
 
         # 3. Generate the Personalized Strava Auth URL using centralized logic
         from backend.strava_auth import generate_auth_link
-        auth_url = generate_auth_link(str(telegram_id))
+        auth_url, _ = generate_auth_link(str(telegram_id), db=db)
 
         return {
             "status": "success",

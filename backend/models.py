@@ -27,6 +27,10 @@ class User(Base):
     atl = Column(Float, default=0.0)   # Acute Training Load (7-day decay)
     ctl = Column(Float, default=0.0)   # Chronic Training Load (42-day decay)
     tsb = Column(Float, default=0.0)   # Training Stress Balance
+    ctl_time_constant_days = Column(Float, default=42.0)
+    atl_time_constant_days = Column(Float, default=7.0)
+    fitness_state_updated_at = Column(DateTime, nullable=True)
+    last_training_stress_date = Column(DateTime, nullable=True)
 
     # Longitudinal Coefficients
     recovery_velocity = Column(Float, default=1.0)
@@ -73,9 +77,16 @@ class User(Base):
 
     # Strava Metadata
     strava_athlete_id = Column(String, nullable=True)
+    strava_custom_client_id = Column(String, nullable=True, index=True)
+    strava_custom_client_secret_encrypted = Column(String, nullable=True)
+    is_using_byok = Column(Boolean, default=False, nullable=False)
     max_hr = Column(Float, default=190.0)
     rest_hr = Column(Float, default=60.0)
     medical_insights = Column(Text, nullable=True)
+
+    # Cost governance / usage metering
+    monthly_token_quota = Column(Integer, nullable=True, default=500000)
+    monthly_tokens_used = Column(Integer, nullable=True, default=0)
 
     last_sync_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
@@ -127,6 +138,11 @@ class Activity(Base):
     cadence_degradation = Column(Float, default=0.0)
     glycogen_depleted_g = Column(Float, default=0.0)
     elevation_adjusted_tss = Column(Float, default=0.0)
+    prescribed_workout = Column(JSONB, default={})
+    compliance_score = Column(Float, nullable=True)
+    pace_compliance_score = Column(Float, nullable=True)
+    hr_compliance_score = Column(Float, nullable=True)
+    compliance_breakdown = Column(JSONB, default={})
 
     created_at = Column(DateTime, default=func.now())
 
@@ -142,10 +158,14 @@ class CoachMemory(Base):
     content = Column(String)
     category = Column(String(30), default="general_chat")
 
-    # Native pgvector 1536-dim Embedding Column
+    # Native pgvector 1536-dim Embedding Column for semantic search
     vector_embedding = Column(Vector(1536), nullable=True)
-    memory_salience = Column(Float, default=1.0)
-
+    memory_salience = Column(Float, default=1.0)  # Importance/relevance score
+    
+    # Structured metadata for memory organization
+    # NOTE: attribute name cannot be `metadata` (reserved by SQLAlchemy Declarative API).
+    metadata_json = Column("metadata", JSONB, default={})  # Tags, references, related IDs, etc.
+    
     created_at = Column(DateTime, default=func.now())
 
     user = relationship("User", back_populates="memories")
@@ -160,6 +180,11 @@ class AthleteInsight(Base):
     insight_text = Column(String, nullable=False)
     confidence_score = Column(Float, default=1.0)
     is_active = Column(Boolean, default=True)
+    
+    # Structured insight metadata (JSONB)
+    # NOTE: attribute name cannot be `metadata` (reserved by SQLAlchemy Declarative API).
+    metadata_json = Column("metadata", JSONB, default={})  # Additional structured data (e.g., tags, related metrics)
+    
     created_at = Column(DateTime, default=func.now())
     last_observed_at = Column(DateTime, default=func.now())
 
@@ -269,6 +294,21 @@ class CoachingDecision(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
+class SafetyAlert(Base):
+    __tablename__ = "safety_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    alert_type = Column(String(50), index=True)
+    severity = Column(String(20), default="warning")
+    message = Column(String(500))
+    source_metric = Column(String(50), nullable=True)
+    source_value = Column(Float, nullable=True)
+    is_resolved = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+
 class AthleteLearning(Base):
     """Track learnings about athlete patterns"""
     __tablename__ = "athlete_learnings"
@@ -316,3 +356,83 @@ Index("idx_memory_user_category", CoachMemory.user_id, CoachMemory.category)
 Index("idx_insights_user_category", AthleteInsight.user_id, AthleteInsight.category)
 Index("idx_medical_report_user", MedicalReport.user_id)
 Index("idx_performance_metric_user_date", PerformanceMetric.user_id, PerformanceMetric.metric_date)
+
+# Additional indices for vector search and filtering
+Index("idx_memory_user_salience", CoachMemory.user_id, CoachMemory.memory_salience)  # Vector search optimization
+Index("idx_insight_active_category", AthleteInsight.user_id, AthleteInsight.is_active, AthleteInsight.category)
+Index("idx_user_active_phase", User.is_active, User.training_phase)  # For athlete filtering
+Index("idx_activity_type_user", Activity.user_id, Activity.type)  # For activity type filtering
+Index("idx_coaching_decision_user_date", CoachingDecision.user_id, CoachingDecision.created_at)  # Recent decisions
+Index("idx_athlete_learning_user_key", AthleteLearning.user_id, AthleteLearning.learning_key)  # Learning lookup
+Index("idx_safety_alert_user_open", SafetyAlert.user_id, SafetyAlert.is_resolved)
+
+
+class CoachingDecisionTrace(Base):
+    """
+    Immutable, explainable audit trail for a single coaching run.
+
+    This is intentionally more detailed than `CoachingDecision` and is designed
+    to support safety audits, explainability, and future replay tooling.
+    """
+
+    __tablename__ = "coaching_decision_traces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+
+    trigger_type = Column(String(30), nullable=True)  # 'webhook', 'scheduled', 'chat', etc.
+    input_event_id = Column(String(200), nullable=True, index=True)
+
+    # Deterministic inputs + outputs
+    safety_context = Column(JSONB, default={})
+    rules_fired = Column(JSONB, default=[])
+    plan_before_safety = Column(JSONB, default={})
+    plan_after_safety = Column(JSONB, default={})
+
+    # LLM-related metadata (redactable)
+    llm_prompt_summary = Column(JSONB, default={})
+    llm_response_metadata = Column(JSONB, default={})
+
+    correlation_id = Column(String(100), nullable=True, index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    user = relationship("User")
+
+
+Index("idx_decision_trace_user_created", CoachingDecisionTrace.user_id, CoachingDecisionTrace.created_at)
+Index("idx_decision_trace_user_event", CoachingDecisionTrace.user_id, CoachingDecisionTrace.input_event_id)
+
+
+class ProcessedEvent(Base):
+    """
+    Idempotency ledger for event-driven processing.
+    """
+
+    __tablename__ = "processed_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(String(200), nullable=False, unique=True, index=True)
+    source = Column(String(50), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+
+class AICostEvent(Base):
+    """
+    Per-call cost and token usage events to support cost accounting and SaaS metering.
+    """
+
+    __tablename__ = "ai_cost_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    org_id = Column(String(50), nullable=True, index=True)
+    feature = Column(String(50), nullable=True, index=True)  # 'chat', 'memory_compression', etc.
+    provider = Column(String(30), nullable=True)
+    model = Column(String(50), nullable=True, index=True)
+    tokens_estimated = Column(Integer, nullable=True)
+    cost_usd_estimated = Column(Float, nullable=True)
+    correlation_id = Column(String(100), nullable=True, index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+

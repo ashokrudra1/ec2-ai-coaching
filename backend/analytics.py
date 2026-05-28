@@ -1,9 +1,9 @@
 # backend/analytics.py
 import logging
-import math
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from backend.models import User, Activity
+from backend.sports_science.state_space import StateSpaceDecayModel
 
 logger = logging.getLogger(__name__)
 
@@ -106,21 +106,19 @@ def update_user_fitness_metrics(db: Session, user_id: int, activity_tss: float =
         user = db.query(User).filter_by(id=user_id).with_for_update().first()
         if not user: return
 
-        ctl_decay = math.exp(-1.0 / 42.0)
-        atl_decay = math.exp(-1.0 / 7.0)
+        state = StateSpaceDecayModel.advance_state(
+            ctl=user.ctl or 0.0,
+            atl=user.atl or 0.0,
+            stress=activity_tss or 0.0,
+            elapsed_days=1.0,
+            ctl_tau_days=user.ctl_time_constant_days or StateSpaceDecayModel.CTL_TAU_DAYS,
+            atl_tau_days=user.atl_time_constant_days or StateSpaceDecayModel.ATL_TAU_DAYS,
+        )
 
-        current_ctl = (user.ctl or 0.0) * ctl_decay
-        current_atl = (user.atl or 0.0) * atl_decay
-
-        if activity_tss > 0.0:
-            current_ctl += activity_tss * (1.0 - ctl_decay)
-            current_atl += activity_tss * (1.0 - atl_decay)
-
-        user.ctl = round(current_ctl, 1)
-        user.atl = round(current_atl, 1)
-        
-        # 🏃‍♂️ SPORTS SCIENCE MODEL CORRECTION: Pure Banister calculation formula mapping
-        user.tsb = round(user.ctl - user.atl, 1)
+        user.ctl = round(state.ctl, 1)
+        user.atl = round(state.atl, 1)
+        user.tsb = round(state.tsb, 1)
+        user.fitness_state_updated_at = datetime.now(timezone.utc)
 
         db.add(user)
         db.commit()

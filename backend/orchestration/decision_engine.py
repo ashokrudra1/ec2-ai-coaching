@@ -1,7 +1,174 @@
 # backend/orchestration/decision_engine.py
 import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PlanProposal:
+    workout: str
+    intensity_zone: int
+    rationale: str
+    metadata: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Objection:
+    objection_id: str
+    severity: str  # 'info' | 'warning' | 'critical'
+    rationale: str
+    metadata: Dict[str, Any]
+
+
+class CouncilAgent(Protocol):
+    agent_id: str
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]: ...
+
+
+class TrainingPlannerAgent:
+    agent_id = "TrainingPlannerAgent"
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]:
+        running_resp = TrainingPrescriptionEngine.prescribe_polarized_block(context)
+        proposal = PlanProposal(
+            workout=running_resp.get("recommended_workout", ""),
+            intensity_zone=int(running_resp.get("target_intensity_zone") or 1),
+            rationale=running_resp.get("rationale", ""),
+            metadata={"source": "TrainingPrescriptionEngine"},
+        )
+        return proposal, []
+
+
+class RecoveryAgent:
+    agent_id = "RecoveryAgent"
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]:
+        objections: List[Objection] = []
+        recovery_score = float(context.get("recovery_score", 100.0) or 100.0)
+        if recovery_score < 45.0:
+            objections.append(
+                Objection(
+                    objection_id="low_recovery_score",
+                    severity="warning",
+                    rationale="Recovery Score < 45 suggests autonomic strain; downgrade intensity.",
+                    metadata={"recovery_score": recovery_score},
+                )
+            )
+        return None, objections
+
+
+class InjuryRiskAgent:
+    agent_id = "InjuryRiskAgent"
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]:
+        objections: List[Objection] = []
+        predictive_risk = context.get("predictive_risk", {}) or {}
+        injury_p = float(predictive_risk.get("injury_probability_14d", 0.0) or 0.0)
+        burnout_p = float(predictive_risk.get("burnout_probability_21d", 0.0) or 0.0)
+        if injury_p > 0.65:
+            objections.append(
+                Objection(
+                    objection_id="injury_probability_high",
+                    severity="critical",
+                    rationale="14-day injury probability exceeds 65% limit.",
+                    metadata={"injury_probability_14d": injury_p},
+                )
+            )
+        if burnout_p > 0.65:
+            objections.append(
+                Objection(
+                    objection_id="burnout_probability_high",
+                    severity="warning",
+                    rationale="21-day burnout probability elevated; bias toward lower impact.",
+                    metadata={"burnout_probability_21d": burnout_p},
+                )
+            )
+        return None, objections
+
+
+class FatigueGuardianAgent:
+    agent_id = "FatigueGuardianAgent"
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]:
+        objections: List[Objection] = []
+        tsb = float((context.get("fatigue_metrics", {}) or {}).get("tsb", 0.0) or 0.0)
+        if tsb < -20.0:
+            objections.append(
+                Objection(
+                    objection_id="fatigue_guardrail_tsb",
+                    severity="critical",
+                    rationale="TSB below -20 indicates high-risk fatigue state; block hard training.",
+                    metadata={"tsb": tsb},
+                )
+            )
+        elif tsb < -10.0:
+            objections.append(
+                Objection(
+                    objection_id="fatigue_caution_tsb",
+                    severity="warning",
+                    rationale="TSB below -10 indicates elevated fatigue; avoid hard intensity.",
+                    metadata={"tsb": tsb},
+                )
+            )
+        return None, objections
+
+
+class MotivationAgent:
+    agent_id = "MotivationAgent"
+
+    def propose(self, context: dict) -> Tuple[Optional[PlanProposal], List[Objection]]:
+        # Phase-1 deterministic tone hints; CoachService can map this into persona/tone later.
+        psych = context.get("psychological", {}) or {}
+        burnout_risk = float(psych.get("burnout_risk", 0.0) or 0.0)
+        confidence = float(psych.get("confidence", 0.8) or 0.8)
+        style = "analytical"
+        if burnout_risk > 0.5:
+            style = "supportive"
+        elif confidence < 0.5:
+            style = "supportive"
+        return (
+            None,
+            [
+                Objection(
+                    objection_id="tone_hint",
+                    severity="info",
+                    rationale=f"Recommended tone_style={style} based on psychological twin.",
+                    metadata={"tone_style": style, "burnout_risk": burnout_risk, "confidence": confidence},
+                )
+            ],
+        )
+
+
+class CouncilCoordinator:
+    def __init__(self, agents: List[CouncilAgent]):
+        self._agents = agents
+
+    def run(self, context: dict) -> Dict[str, Any]:
+        proposals: List[Dict[str, Any]] = []
+        objections: List[Dict[str, Any]] = []
+
+        chosen: Optional[PlanProposal] = None
+        for agent in self._agents:
+            proposal, agent_objections = agent.propose(context)
+            if proposal is not None and chosen is None:
+                chosen = proposal
+            if proposal is not None:
+                proposals.append({"agent_id": agent.agent_id, **proposal.__dict__})
+            for obj in agent_objections:
+                objections.append({"agent_id": agent.agent_id, **obj.__dict__})
+
+        if chosen is None:
+            chosen = PlanProposal(
+                workout="Recovery movement: walk or easy spin 20–30 minutes",
+                intensity_zone=1,
+                rationale="No planner proposal available; defaulting to conservative recovery.",
+                metadata={"source": "CouncilCoordinator.default"},
+            )
+
+        return {"chosen": chosen, "proposals": proposals, "objections": objections}
 
 class TrainingPrescriptionEngine:
     """
@@ -108,16 +275,36 @@ class ConflictResolutionRouter:
 class DecisionEngine:
     @staticmethod
     def generate_final_response(context: dict) -> dict:
-        """Coordinates and arbitrates programmatic coaching decisions."""
-        running_resp = TrainingPrescriptionEngine.prescribe_polarized_block(context)
-        
+        """Coordinates and arbitrates programmatic coaching decisions (deterministic council)."""
+        council = CouncilCoordinator(
+            agents=[
+                TrainingPlannerAgent(),
+                FatigueGuardianAgent(),
+                InjuryRiskAgent(),
+                RecoveryAgent(),
+                MotivationAgent(),
+            ]
+        )
+        council_result = council.run(context)
+        chosen: PlanProposal = council_result["chosen"]
+
+        running_resp = {
+            "recommended_workout": chosen.workout,
+            "target_intensity_zone": chosen.intensity_zone,
+            "rationale": chosen.rationale,
+        }
+
         arbitration = ConflictResolutionRouter.arbitrate(
             running_decision=running_resp,
             recovery_score=context.get("recovery_score", 100.0),
-            predictive_risk=context.get("predictive_risk", {})
+            predictive_risk=context.get("predictive_risk", {}),
         )
 
         return {
             "arbitrated_plan": arbitration,
-            "running_analysis": running_resp
+            "running_analysis": running_resp,
+            "council": {
+                "proposals": council_result["proposals"],
+                "objections": council_result["objections"],
+            },
         }

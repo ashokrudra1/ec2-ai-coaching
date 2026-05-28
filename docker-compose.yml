@@ -1,29 +1,41 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16-latest
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "-c max_connections=200 -c shared_buffers=256MB"
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01-init-pgvector.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
+    command: >
+      postgres
+      -c log_statement=all
+      -c log_duration=on
+      -c log_min_duration_statement=1000
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    command: redis-server --appendonly yes
 
   api:
     build:
@@ -34,7 +46,7 @@ services:
       - "8001:8001"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
-      REDIS_URL: ${REDIS_URL}
+      REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: ${ENVIRONMENT:-production}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
@@ -45,21 +57,30 @@ services:
       STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       SENTRY_DSN: ${SENTRY_DSN}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    stdin_open: true
+    tty: true
 
   celery_worker:
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    command: celery -A backend.celery_app worker -Q chat_critical,data_sync,onboarding_heavy,scheduled_reports,celery --loglevel=info
+    command: celery -A backend.celery_app worker -Q chat_critical,data_sync,onboarding_heavy,scheduled_reports,celery --loglevel=info --concurrency=4
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
-      REDIS_URL: ${REDIS_URL}
+      REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: ${ENVIRONMENT:-production}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
@@ -70,21 +91,29 @@ services:
       STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       SENTRY_DSN: ${SENTRY_DSN}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "backend.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   celery_beat:
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    command: celery -A backend.celery_app beat --loglevel=info
+    command: celery -A backend.celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
-      REDIS_URL: ${REDIS_URL}
+      REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: ${ENVIRONMENT:-production}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
@@ -95,11 +124,16 @@ services:
       STRAVA_REDIRECT_URI: ${STRAVA_REDIRECT_URI}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       SENTRY_DSN: ${SENTRY_DSN}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - ./celerybeat-schedule:/app/celerybeat-schedule
 
   frontend:
     build:
@@ -109,10 +143,15 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: https://vedaactivewellness.xyz
+      NEXT_PUBLIC_API_URL: ${FRONTEND_API_URL:-https://vedaactivewellness.xyz}
       INTERNAL_API_URL: http://api:8001
     depends_on:
       - api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   caddy:
     image: caddy:2-alpine
@@ -130,5 +169,11 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   caddy_data:
   caddy_config:
+
+networks:
+  default:
+    name: ec2-ai-coaching-network
+    driver: bridge

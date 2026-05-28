@@ -1,7 +1,8 @@
 # backend/security/usage_governance.py
 import logging
+from typing import Optional
 from sqlalchemy.orm import Session
-from backend.models import User
+from backend.models import User, AICostEvent
 
 logger = logging.getLogger(__name__)
 
@@ -34,3 +35,33 @@ class UsageGovernor:
         except Exception as e:
             db.rollback()
             logger.error(f"❌ Failed to log token usage: {str(e)}")
+
+    @staticmethod
+    def log_cost_event(
+        db: Session,
+        *,
+        user_id: Optional[int],
+        org_id: Optional[str],
+        feature: str,
+        provider: Optional[str],
+        model: Optional[str],
+        tokens_estimated: Optional[int],
+        cost_usd_estimated: Optional[float],
+        correlation_id: Optional[str],
+    ) -> None:
+        try:
+            row = AICostEvent(
+                user_id=user_id,
+                org_id=org_id,
+                feature=feature,
+                provider=provider,
+                model=model,
+                tokens_estimated=tokens_estimated,
+                cost_usd_estimated=cost_usd_estimated,
+                correlation_id=correlation_id,
+            )
+            db.add(row)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to write AICostEvent")
