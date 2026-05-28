@@ -177,7 +177,7 @@ class TestPDFUtils:
         keywords = extract_medical_keywords(text)
         
         assert "patient" in keywords
-        assert "diagnosis" in [k for k in keywords if k in text.lower()]
+        assert "diagnosis" in keywords
         assert "diabetes" in keywords
         assert "blood pressure" in keywords
 

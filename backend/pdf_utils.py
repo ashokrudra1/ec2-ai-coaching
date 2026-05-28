@@ -60,22 +60,27 @@ def clean_extracted_text(text: str) -> str:
         return ""
     
     try:
-        # Remove control characters except newline and tab
-        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-        
-        # Normalize line breaks (multiple newlines -> single newline)
-        text = re.sub(r'\n\n+', '\n', text)
-        
-        # Collapse multiple spaces but preserve paragraphs
-        text = re.sub(r' +', ' ', text)
-        
-        # Strip leading/trailing whitespace
-        text = text.strip()
-        
-        logger.debug(f"Text cleaned: {len(text)} characters")
-        return text
-        
-    except Exception as e:
+        # Normalize CRLF/CR to LF first.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Treat tabs as structural separators for extracted PDF fragments.
+        text = text.replace("\t", "\n")
+
+        # Remove control characters except newline.
+        text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+
+        # Trim spaces around each line, then drop empty lines.
+        lines = [line.strip() for line in text.split("\n")]
+        lines = [line for line in lines if line]
+
+        # Collapse extra intra-line whitespace.
+        lines = [re.sub(r"\s{2,}", " ", line) for line in lines]
+
+        cleaned = "\n".join(lines).strip()
+        logger.debug("Text cleaned: %s characters", len(cleaned))
+        return cleaned
+
+    except (TypeError, ValueError) as e:
         logger.error(f"Text cleaning failed: {e}")
         return text
 
@@ -118,20 +123,43 @@ def extract_medical_keywords(text: str) -> list[str]:
     Returns:
         List of detected keywords
     """
-    medical_keywords = [
-        "doctor", "patient", "diagnosis", "symptom", "treatment",
-        "medication", "prescription", "blood pressure", "heart rate",
-        "cholesterol", "glucose", "diabetes", "asthma", "allergy",
-        "infection", "injury", "surgery", "therapy", "test",
-        "examination", "report", "lab", "x-ray", "ultrasound",
-        "ecg", "ekg", "mri", "ct scan", "blood work"
-    ]
-    
+    keyword_patterns: dict[str, str] = {
+        "doctor": r"\bdoctor(s)?\b",
+        "patient": r"\bpatient(s)?\b",
+        "diagnosis": r"\bdiagnos(is|es|ed|ing)\b",
+        "symptom": r"\bsymptom(s)?\b",
+        "treatment": r"\btreatment(s)?\b",
+        "medication": r"\bmedication(s)?\b",
+        "prescription": r"\bprescription(s)?\b",
+        "blood pressure": r"\bblood pressure\b",
+        "heart rate": r"\bheart rate\b",
+        "cholesterol": r"\bcholesterol\b",
+        "glucose": r"\bglucose\b",
+        "diabetes": r"\bdiabetes\b",
+        "asthma": r"\basthma\b",
+        "allergy": r"\ballerg(y|ies)\b",
+        "infection": r"\binfection(s)?\b",
+        "injury": r"\binjur(y|ies)\b",
+        "surgery": r"\bsurger(y|ies)\b",
+        "therapy": r"\btherap(y|ies)\b",
+        "test": r"\btest(s)?\b",
+        "examination": r"\bexamination(s)?\b",
+        "report": r"\breport(s)?\b",
+        "lab": r"\blab(s)?\b",
+        "x-ray": r"\bx[\s-]?ray(s)?\b",
+        "ultrasound": r"\bultrasound(s)?\b",
+        "ecg": r"\becg\b",
+        "ekg": r"\bekg\b",
+        "mri": r"\bmri\b",
+        "ct scan": r"\bct scan(s)?\b",
+        "blood work": r"\bblood work\b",
+    }
+
     text_lower = text.lower()
-    found_keywords = []
-    
-    for keyword in medical_keywords:
-        if keyword in text_lower:
+    found_keywords: list[str] = []
+    for keyword, pattern in keyword_patterns.items():
+        if re.search(pattern, text_lower):
             found_keywords.append(keyword)
-    
-    return list(set(found_keywords))  # Remove duplicates
+
+    # Preserve insertion order while removing duplicates.
+    return list(dict.fromkeys(found_keywords))
