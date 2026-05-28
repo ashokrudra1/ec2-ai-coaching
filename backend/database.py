@@ -257,23 +257,31 @@ def ensure_pgvector_extension():
     Ensure pgvector extension is created in PostgreSQL.
     This is required for vector embeddings in CoachMemory model.
     """
-    logger.info("🔍 Checking pgvector extension...")
+    logger.info("🔍 Checking vector extension...")
     try:
         with engine.connect() as conn:
-            # Check if extension exists
+            # RDS/PostgreSQL distributions may expose this extension as `vector`
+            # instead of `pgvector`, so we accept either installed name.
             result = conn.execute(
-                text("SELECT 1 FROM pg_extension WHERE extname = 'pgvector'")
+                text("SELECT 1 FROM pg_extension WHERE extname IN ('vector', 'pgvector')")
             ).scalar()
             
             if result is None:
-                logger.info("📦 Creating pgvector extension...")
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgvector"))
-                conn.commit()
-                logger.info("✅ pgvector extension created successfully")
+                logger.info("📦 Creating vector extension...")
+                try:
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                    conn.commit()
+                    logger.info("✅ vector extension created successfully")
+                except Exception:
+                    # Fallback for environments that still register the old name.
+                    conn.rollback()
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgvector"))
+                    conn.commit()
+                    logger.info("✅ pgvector extension created successfully")
             else:
-                logger.info("✅ pgvector extension already exists")
+                logger.info("✅ vector extension already exists")
     except Exception as e:
-        logger.error(f"❌ Failed to ensure pgvector extension: {str(e)}")
+        logger.error(f"❌ Failed to ensure vector extension: {str(e)}")
         raise
 
 
