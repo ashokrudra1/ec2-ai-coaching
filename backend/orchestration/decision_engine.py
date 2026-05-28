@@ -276,16 +276,8 @@ class DecisionEngine:
     @staticmethod
     def generate_final_response(context: dict) -> dict:
         """Coordinates and arbitrates programmatic coaching decisions (deterministic council)."""
-        council = CouncilCoordinator(
-            agents=[
-                TrainingPlannerAgent(),
-                FatigueGuardianAgent(),
-                InjuryRiskAgent(),
-                RecoveryAgent(),
-                MotivationAgent(),
-            ]
-        )
-        council_result = council.run(context)
+        from backend.orchestration.coach_council import run_coach_council
+        council_result = run_coach_council(context)
         chosen: PlanProposal = council_result["chosen"]
 
         running_resp = {

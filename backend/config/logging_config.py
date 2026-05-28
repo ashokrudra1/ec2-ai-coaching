@@ -22,9 +22,16 @@ class StructuredJsonFormatter(logging.Formatter):
         if record.exc_info:
             log_object["exception"] = self.formatException(record.exc_info)
             
-        return json.dumps(log_object)
+        return json.dumps(log_object, ensure_ascii=False)
 
 def setup_production_logging():
+    # Enforce UTF-8 output to prevent Unicode corruption in logs/terminal streams.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
+    logging.basicConfig(level=logging.INFO, encoding="utf-8", force=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     

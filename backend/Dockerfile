@@ -28,6 +28,9 @@ FROM python:3.11-slim
 # Set environment variables for production
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
     PYTHONPATH=/app \
     PIP_NO_CACHE_DIR=1 \
     ENVIRONMENT=production

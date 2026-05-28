@@ -78,3 +78,33 @@ def emergency_condition_detected(*, event_id: str, user_id: Optional[int], paylo
         payload=payload or {},
     )
 
+
+def risk_detected(*, event_id: str, user_id: Optional[int], payload: Dict[str, Any]) -> DomainEvent:
+    return DomainEvent(
+        event_type="RiskDetected",
+        event_id=event_id,
+        occurred_at=now_utc(),
+        user_id=user_id,
+        payload=payload or {},
+    )
+
+
+def readiness_updated(*, event_id: str, user_id: int, payload: Dict[str, Any]) -> DomainEvent:
+    return DomainEvent(
+        event_type="ReadinessUpdated",
+        event_id=event_id,
+        occurred_at=now_utc(),
+        user_id=user_id,
+        payload=payload or {},
+    )
+
+
+def workout_skipped(*, event_id: str, user_id: int, payload: Dict[str, Any]) -> DomainEvent:
+    return DomainEvent(
+        event_type="WorkoutSkipped",
+        event_id=event_id,
+        occurred_at=now_utc(),
+        user_id=user_id,
+        payload=payload or {},
+    )
+

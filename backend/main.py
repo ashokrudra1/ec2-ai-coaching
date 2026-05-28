@@ -6,6 +6,7 @@ Handles API requests, real-time coaching, and system orchestration.
 import os
 import asyncio
 import logging
+import sys
 import uvicorn
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,11 @@ from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 # 1. EARLY LOGGING SETUP (Before any other imports)
 # ============================================================================
 from backend.config.logging_config import setup_production_logging
+# Force UTF-8 process I/O for Windows and mixed shell environments.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 setup_production_logging()
 logger = logging.getLogger(__name__)
 
@@ -483,12 +489,14 @@ def get_activities(db: Session = Depends(get_db)):
 # ============================================================================
 from backend.strava_webhooks import router as strava_webhook_router
 from backend.decision_traces import router as decision_trace_router
+from backend.live_coaching.routes import router as live_coaching_router
 
 app.include_router(webhook_router)           # Telegram webhooks
 app.include_router(auth_router)              # Local auth
 app.include_router(strava_auth_router)       # Strava OAuth
 app.include_router(strava_webhook_router)    # Strava activity webhooks
 app.include_router(decision_trace_router)    # Coaching explainability traces
+app.include_router(live_coaching_router)     # Real-time intervention evaluation
 
 # ============================================================================
 # 13. ENTRY POINT

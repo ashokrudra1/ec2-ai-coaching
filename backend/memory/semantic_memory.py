@@ -10,6 +10,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 logger = logging.getLogger(__name__)
 
 class SemanticMemory:
+    RECENCY_HALF_LIFE_DAYS = 14.0
+
 
     @staticmethod
     @retry(
@@ -62,16 +64,31 @@ class SemanticMemory:
             query_vector = SemanticMemory.get_embedding(query_text)
             
             # Using pgvector's native cosine distance operator '<=>' via SQLAlchemy
-            results = (
+            raw_results = (
                 db.query(CoachMemory)
                 .filter(CoachMemory.user_id == user_id)
                 .order_by(CoachMemory.vector_embedding.cosine_distance(query_vector))
-                .limit(limit)
+                .limit(max(limit * 6, 12))
                 .all()
             )
 
-            if not results:
+            if not raw_results:
                 return "No historical pattern memories saved yet."
+
+            now = datetime.utcnow()
+            weighted = []
+            for mem in raw_results:
+                semantic_similarity = SemanticMemory._cosine_similarity(query_vector, mem.vector_embedding or [])
+                age_days = max(0.0, (now - mem.created_at).total_seconds() / 86400.0) if mem.created_at else 30.0
+                recency_decay = math.exp(-age_days / SemanticMemory.RECENCY_HALF_LIFE_DAYS)
+                salience = float(mem.memory_salience or 0.5)
+                injury_weight = 1.15 if any(k in (mem.content or "").lower() for k in ["injury", "pain", "ache", "strain"]) else 1.0
+                behavior_weight = 1.1 if mem.category in {"tactical", "compliance", "injury"} else 1.0
+                final_score = semantic_similarity * recency_decay * max(0.25, salience) * injury_weight * behavior_weight
+                weighted.append((final_score, mem))
+
+            weighted.sort(key=lambda x: x[0], reverse=True)
+            results = [m for _, m in weighted[:limit]]
 
             formatted_context = []
             for r in results:
@@ -81,3 +98,14 @@ class SemanticMemory:
         except Exception as e:
             logger.error(f"❌ Native vector retrieval crashed: {str(e)}")
             return "Historical patterns currently offline."
+
+    @staticmethod
+    def _cosine_similarity(a: list, b: list) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(float(x) * float(y) for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(float(x) * float(x) for x in a))
+        norm_b = math.sqrt(sum(float(y) * float(y) for y in b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_a * norm_b)))

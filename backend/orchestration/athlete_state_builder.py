@@ -2,10 +2,12 @@
 import logging
 from sqlalchemy import desc
 from backend.models import User, Activity, AthleteInsight
+from backend.athlete_state.digital_twin_engine import DigitalTwinEngine
 from backend.athlete_state.fatigue_engine import FatigueEngine
 from backend.athlete_state.recovery_engine import RecoveryEngine
 from backend.athlete_state.injury_risk_engine import InjuryRiskEngine
 from backend.athlete_state.physiology_engine import PhysiologyEngine
+from backend.recovery.recovery_optimizer import RecoveryOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +178,22 @@ class AthleteStateBuilder:
             "plateau_risk": plateau_risk
         }
 
+        twin_projection = DigitalTwinEngine.simulate(
+            {
+                "fatigue_metrics": fatigue,
+                "physiological": physiological_twin,
+                "behavioral": behavioral_twin,
+                "psychological": psychological_twin,
+            }
+        )
+        recovery_state = RecoveryOptimizer.compute_recovery_state(
+            hrv_baseline=float(physiological_twin.get("hrv_baseline", 60.0) or 60.0),
+            hrv_today=float(physiological_twin.get("hrv_today", 58.0) or 58.0),
+            sleep_hours=float(physiological_twin.get("sleep_hours", 7.0) or 7.0),
+            load_tss_24h=float(fatigue.get("acute_load", 0.0) or 0.0),
+            resting_hr_delta=float(physiological_twin.get("resting_hr_delta", 0.0) or 0.0),
+        )
+
         return {
             "user_id": user.id,
             "name": user.name,
@@ -189,6 +207,9 @@ class AthleteStateBuilder:
             "behavioral": behavioral_twin,
             "psychological": psychological_twin,
             "predictive_risk": predictive_risk,
+            "digital_twin_projection": twin_projection.__dict__,
+            "recovery_state": recovery_state,
+            "daily_recovery_protocol": RecoveryOptimizer.daily_recovery_protocol(recovery_state),
             "cardiovascular_trends": {
                 "latest_cardiac_decoupling": current_decoupling,
                 "latest_stride_degradation": current_degradation,

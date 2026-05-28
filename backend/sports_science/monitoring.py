@@ -69,6 +69,17 @@ class AthleteMonitoringService:
                     payload={"tsb": state.tsb, "ctl": state.ctl, "atl": state.atl, "acwr": state.acwr},
                 )
             )
+            event_bus.publish(
+                domain_events.readiness_updated(
+                    event_id=f"readiness:{user.id}:{activity.id or activity.strava_id or 'na'}",
+                    user_id=user.id,
+                    payload={
+                        "tsb": state.tsb,
+                        "injury_risk_score": state.injury_risk_score,
+                        "fatigue_level": state.fatigue_level,
+                    },
+                )
+            )
         except Exception:
             # Never fail activity processing for event emission.
             pass
