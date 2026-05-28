@@ -1,0 +1,82 @@
+# 🚀 EC2 FINAL SETUP - COPY THESE COMMANDS AND RUN ON EC2
+
+# ============================================================================
+# COMMAND 1: Navigate to app directory
+# ============================================================================
+cd ~/ec2-ai-coaching
+
+# ============================================================================
+# COMMAND 2: Create .env file from template
+# ============================================================================
+cp .env.example .env
+
+# ============================================================================
+# COMMAND 3: Initialize database (create all tables)
+# ============================================================================
+docker-compose exec -T api python -c "from backend.database import Base, engine; Base.metadata.create_all(bind=engine); print('✅ Database tables created')"
+
+# ============================================================================
+# COMMAND 4: Check all services running
+# ============================================================================
+docker-compose ps
+
+# ============================================================================
+# COMMAND 5: Check health
+# ============================================================================
+curl -s http://localhost:8001/health | python3 -m json.tool
+
+# ============================================================================
+# COMMAND 6: Verify database tables
+# ============================================================================
+docker-compose exec -T postgres psql -U postgres -c "SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema = 'public';"
+
+# ============================================================================
+# COMMAND 7: View database tables
+# ============================================================================
+docker-compose exec -T postgres psql -U postgres -c "\dt"
+
+# ============================================================================
+# Now configure Telegram Bot (IMPORTANT!)
+# ============================================================================
+
+# STEP 1: Create bot with @BotFather (on your phone/computer)
+# - Open Telegram
+# - Search for @BotFather
+# - Send: /newbot
+# - Follow prompts
+# - GET THE BOT TOKEN (looks like: 123456:ABC-DEFghijklmnop...)
+
+# STEP 2: Add token to .env file on EC2
+nano .env
+
+# Find this line:
+# TELEGRAM_BOT_TOKEN=your-telegram-bot-token-here
+
+# Replace with your actual token:
+# TELEGRAM_BOT_TOKEN=123456:ABC-DEFghijklmnop...
+
+# Save: Ctrl+X, then press Y, then press Enter
+
+# STEP 3: Restart API
+docker-compose restart api
+
+# STEP 4: Wait for restart
+sleep 10
+
+# STEP 5: Verify API is healthy
+curl -s http://localhost:8001/health | python3 -m json.tool
+
+# ============================================================================
+# NOW TEST IN TELEGRAM
+# ============================================================================
+
+# 1. On your phone, search for your bot (by the username you created)
+# 2. Send: /start
+# 3. Complete registration form
+# 4. Check user in database:
+
+docker-compose exec -T postgres psql -U postgres -c "SELECT id, name, email, telegram_chat_id, is_active FROM users LIMIT 5;"
+
+# ============================================================================
+# YOU'RE LIVE!
+# ============================================================================

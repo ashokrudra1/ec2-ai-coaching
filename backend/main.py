@@ -13,10 +13,15 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pathlib import Path
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
@@ -223,23 +228,39 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Shutdown error: {str(e)}")
 
 # ============================================================================
-# 6. CREATE FASTAPI APPLICATION
+# 6. CREATE FASTAPI APPLICATION WITH RATE LIMITING
 # ============================================================================
+limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+
 app = FastAPI(
     title="Veda AI Endurance Coach",
     description="AI-powered endurance coaching system with real-time training analysis",
     version="4.1.0",
-    lifespan=lifespan  # Register lifespan handler
+    lifespan=lifespan
 )
 
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
 # ============================================================================
-# 7. MIDDLEWARE CONFIGURATION
+# 7. RATE LIMIT EXCEEDED HANDLER
+# ============================================================================
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    logger.warning(f"Rate limit exceeded for {request.client.host}")
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded. Maximum 100 requests per minute."}
+    )
+
+# ============================================================================
+# 8. MIDDLEWARE CONFIGURATION
 # ============================================================================
 # CORS Configuration (Strict Production Lock)
 ALLOWED_ORIGINS = [
     os.getenv("ALLOWED_ORIGIN", "https://vedaactivewellness.xyz"),
-    "http://localhost:3000",      # Development frontend
-    "http://localhost:8001",      # Development API
+    "http://localhost:3000",
+    "http://localhost:8001",
 ]
 
 if os.getenv("ENVIRONMENT", "production").lower() == "development":
@@ -259,13 +280,13 @@ if settings.SENTRY_DSN:
     app.add_middleware(SentryAsgiMiddleware)
 
 # ============================================================================
-# 8. TEMPLATE CONFIGURATION
+# 9. TEMPLATE CONFIGURATION
 # ============================================================================
 base_path = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(base_path / "templates"))
 
 # ============================================================================
-# 9. BASIC ROUTES
+# 10. BASIC ROUTES
 # ============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -274,15 +295,17 @@ async def home(request: Request):
 
 
 @app.get("/ping")
-async def ping():
+@limiter.limit("60/minute")
+async def ping(request: Request):
     """Simple ping endpoint for load balancer health checks"""
     return {"status": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # ============================================================================
-# 10. COMPREHENSIVE HEALTH CHECK ENDPOINT
+# 11. COMPREHENSIVE HEALTH CHECK ENDPOINT
 # ============================================================================
 @app.get("/health")
-def health_check_endpoint(db: Session = Depends(get_db)):
+@limiter.limit("120/minute")
+def health_check_endpoint(request: Request, db: Session = Depends(get_db)):
     """
     Comprehensive health check providing detailed system status.
     
@@ -370,7 +393,6 @@ def health_check_endpoint(db: Session = Depends(get_db)):
             }
         else:
             health_status["components"]["celery_workers"]["status"] = "no workers active"
-            # Not marking overall as unhealthy since workers may not be started yet
     except Exception as e:
         health_status["components"]["celery_workers"]["status"] = f"error: {str(e)[:50]}"
     
@@ -405,21 +427,24 @@ def health_check_endpoint(db: Session = Depends(get_db)):
 
 
 @app.get("/health/metrics")
-def health_metrics_snapshot():
+@limiter.limit("60/minute")
+def health_metrics_snapshot(request: Request):
     """In-process metrics snapshot for quick operational debugging."""
     return snapshot_metrics()
 
 
 @app.get("/ops/org-cost/{org_id}")
-def org_cost_summary(org_id: str, db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def org_cost_summary(org_id: str, request: Request, db: Session = Depends(get_db)):
     """Tenant-level spend and token visibility for SaaS operations."""
     return UsageGovernor.get_org_cost_summary(db, org_id)
 
 # ============================================================================
-# 11. DASHBOARD STATISTICS ENDPOINTS
+# 12. DASHBOARD STATISTICS ENDPOINTS
 # ============================================================================
 @app.get("/api/stats")
-def get_dashboard_stats(db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def get_dashboard_stats(request: Request, db: Session = Depends(get_db)):
     """Returns aggregate stats for the primary active user"""
     try:
         user = db.query(User).filter_by(is_active=True).first()
@@ -455,7 +480,8 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
 
 
 @app.get("/api/activities")
-def get_activities(db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def get_activities(request: Request, db: Session = Depends(get_db)):
     """Returns recent activities for the dashboard"""
     try:
         user = db.query(User).filter_by(is_active=True).first()
@@ -485,21 +511,21 @@ def get_activities(db: Session = Depends(get_db)):
         return []
 
 # ============================================================================
-# 12. INCLUDE ROUTERS
+# 13. INCLUDE ROUTERS
 # ============================================================================
 from backend.strava_webhooks import router as strava_webhook_router
 from backend.decision_traces import router as decision_trace_router
 from backend.live_coaching.routes import router as live_coaching_router
 
-app.include_router(webhook_router)           # Telegram webhooks
-app.include_router(auth_router)              # Local auth
-app.include_router(strava_auth_router)       # Strava OAuth
-app.include_router(strava_webhook_router)    # Strava activity webhooks
-app.include_router(decision_trace_router)    # Coaching explainability traces
-app.include_router(live_coaching_router)     # Real-time intervention evaluation
+app.include_router(webhook_router)
+app.include_router(auth_router)
+app.include_router(strava_auth_router)
+app.include_router(strava_webhook_router)
+app.include_router(decision_trace_router)
+app.include_router(live_coaching_router)
 
 # ============================================================================
-# 13. ENTRY POINT
+# 14. ENTRY POINT
 # ============================================================================
 if __name__ == "__main__":
     uvicorn.run("backend.main:app", host="0.0.0.0", port=8001, reload=False)

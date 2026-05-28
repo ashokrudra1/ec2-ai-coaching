@@ -1,0 +1,201 @@
+================================================================================
+DELETE ALL USERS & RESET DATABASE - QUICK COMMANDS
+================================================================================
+
+⚠️  WARNING: These commands will permanently delete all users!
+
+================================================================================
+METHOD 1: DIRECT SQL COMMAND (Quickest)
+================================================================================
+
+Run this on your EC2:
+
+docker-compose exec -T postgres psql -U postgres << EOF
+TRUNCATE TABLE users CASCADE;
+ALTER SEQUENCE users_id_seq RESTART WITH 1;
+SELECT COUNT(*) as remaining_users FROM users;
+EOF
+
+Result: All users deleted, ID counter reset to 1
+
+================================================================================
+METHOD 2: DELETE SCRIPT (Safest - with confirmation)
+================================================================================
+
+Run on EC2:
+
+chmod +x scripts/reset-users.sh
+bash scripts/reset-users.sh
+
+(Prompts you to type "YES" to confirm before deleting)
+
+================================================================================
+METHOD 3: DELETE SPECIFIC USER (If you want to keep some users)
+================================================================================
+
+Delete user with ID 1:
+
+docker-compose exec -T postgres psql -U postgres -c \
+  "DELETE FROM users WHERE id = 1; SELECT * FROM users;"
+
+Delete user by Telegram ID:
+
+docker-compose exec -T postgres psql -U postgres -c \
+  "DELETE FROM users WHERE telegram_chat_id = 5348200695;"
+
+================================================================================
+METHOD 4: VERIFY CURRENT USERS BEFORE DELETING
+================================================================================
+
+View all users:
+
+docker-compose exec -T postgres psql -U postgres -c \
+  "SELECT id, name, email, telegram_chat_id, created_at FROM users;"
+
+Count users:
+
+docker-compose exec -T postgres psql -U postgres -c \
+  "SELECT COUNT(*) as user_count FROM users;"
+
+================================================================================
+METHOD 5: COMPLETE DATABASE RESET (Delete everything)
+================================================================================
+
+⚠️  WARNING: This deletes ALL data in all tables!
+
+Drop all tables and recreate:
+
+docker-compose exec -T postgres psql -U postgres << EOF
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO postgres;
+GRANT ALL ON SCHEMA public TO public;
+EOF
+
+Then reinitialize:
+
+docker-compose exec -T api python -c \
+  "from backend.database import Base, engine; Base.metadata.create_all(bind=engine); print('Database reinitialized')"
+
+================================================================================
+STEP-BY-STEP: DELETE USERS & START FRESH
+================================================================================
+
+Step 1: SSH to EC2
+ssh -i "C:\Users\HP\Downloads\coaching.pem" ubuntu@13.233.127.186
+
+Step 2: Navigate to app
+cd ~/ec2-ai-coaching
+
+Step 3: Delete all users
+docker-compose exec -T postgres psql -U postgres << EOF
+TRUNCATE TABLE users CASCADE;
+ALTER SEQUENCE users_id_seq RESTART WITH 1;
+EOF
+
+Step 4: Verify deletion
+docker-compose exec -T postgres psql -U postgres -c \
+  "SELECT COUNT(*) as remaining_users FROM users;"
+
+Expected output: remaining_users = 0
+
+Step 5: Ready for new users!
+- Send /start to your Telegram bot
+- Complete registration
+- New user will be created with ID 1
+
+================================================================================
+ONE-LINER COMMANDS
+================================================================================
+
+Delete all users (copy-paste ready):
+docker-compose exec -T postgres psql -U postgres -c "TRUNCATE TABLE users CASCADE; ALTER SEQUENCE users_id_seq RESTART WITH 1;"
+
+Check user count:
+docker-compose exec -T postgres psql -U postgres -c "SELECT COUNT(*) FROM users;"
+
+List all users:
+docker-compose exec -T postgres psql -U postgres -c "SELECT id, name, email, telegram_chat_id FROM users;"
+
+Delete user with Telegram ID 5348200695:
+docker-compose exec -T postgres psql -U postgres -c "DELETE FROM users WHERE telegram_chat_id = 5348200695;"
+
+================================================================================
+VERIFICATION COMMANDS
+================================================================================
+
+After deletion, verify:
+
+docker-compose exec -T postgres psql -U postgres << EOF
+SELECT COUNT(*) as user_count FROM users;
+SELECT * FROM users;
+SELECT currval('users_id_seq') as next_id;
+EOF
+
+Expected:
+- user_count = 0
+- No rows in SELECT *
+- next_id = 1 (ready for first user)
+
+================================================================================
+REGISTER NEW USER AFTER DELETION
+================================================================================
+
+1. Delete all users (see above)
+
+2. Test Telegram bot:
+   - Open Telegram
+   - Search for your bot
+   - Send: /start
+   - Complete registration form
+
+3. Verify new user:
+   docker-compose exec -T postgres psql -U postgres -c \
+     "SELECT id, name, email, telegram_chat_id FROM users;"
+
+   Should show:
+   id | name | email | telegram_chat_id
+   1  | Your name | (empty) | YOUR_TELEGRAM_ID
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+If you get "relation 'users' does not exist":
+  → Database tables not initialized
+  → Run: docker-compose exec -T api python -c "from backend.database import Base, engine; Base.metadata.create_all(bind=engine)"
+
+If you get permission denied:
+  → Make sure docker-compose is running
+  → Check: docker-compose ps
+
+If psql command not found:
+  → PostgreSQL client not installed in container
+  → Use alternative: docker exec ec2-ai-coaching-postgres-1 psql -U postgres -c "..."
+
+================================================================================
+BACKUP BEFORE DELETING (RECOMMENDED)
+================================================================================
+
+Create backup first:
+bash scripts/backup-to-s3.sh
+
+Then delete:
+docker-compose exec -T postgres psql -U postgres -c "TRUNCATE TABLE users CASCADE;"
+
+Now you can restore if needed:
+bash scripts/restore-from-s3.sh <backup-file-name>
+
+================================================================================
+DONE!
+================================================================================
+
+After deletion, you're ready to:
+✅ Register fresh users via Telegram bot
+✅ Start with clean database
+✅ Test bot registration flow
+✅ Build from scratch
+
+Next: Send /start to your Telegram bot!
+
+================================================================================
