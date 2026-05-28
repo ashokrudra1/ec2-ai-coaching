@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 EMERGENCY_TRIGGERS = ["chest pain", "tightness in chest", "shortness of breath", "severe dizziness", "passed out", "unconscious", "heart racing abnormally"]
 STRAVA_BACKFILL_REQUEST_DELAY_SECONDS = float(os.getenv("STRAVA_BACKFILL_REQUEST_DELAY_SECONDS", "10"))
 
-@celery_app.task(name="backend.tasks.sync_tasks.trigger_onboarding_backfill", rate_limit=os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/15m"))
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_onboarding_backfill", rate_limit="95/m")
 def trigger_onboarding_backfill(user_id: int):
     """
     Executes intensive historical backfill safely inside a worker process 
@@ -42,7 +42,7 @@ def trigger_onboarding_backfill(user_id: int):
     return asyncio.run(strava_manager.backfill(user_id))
 
 
-@celery_app.task(name="backend.tasks.sync_tasks.trigger_rate_limited_backfill_page", rate_limit=os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/15m"))
+@celery_app.task(name="backend.tasks.sync_tasks.trigger_rate_limited_backfill_page", rate_limit="95/m")
 def trigger_rate_limited_backfill_page(user_id: int, page: int = 1, per_page: int = 100):
     from backend.strava_manager import strava_manager
     safe_per_page = max(1, min(int(per_page or 100), 100))
@@ -51,7 +51,7 @@ def trigger_rate_limited_backfill_page(user_id: int, page: int = 1, per_page: in
     return asyncio.run(strava_manager.backfill(user_id, max_activities_limit=safe_per_page))
 
 
-@celery_app.task(name="backend.tasks.sync_tasks.process_strava_webhook_event", rate_limit="95/15m")
+@celery_app.task(name="backend.tasks.sync_tasks.process_strava_webhook_event", rate_limit="95/m")
 def process_strava_webhook_event(athlete_id: int, activity_id: int):
     db = SessionLocal()
     try:

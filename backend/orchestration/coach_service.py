@@ -1,4 +1,5 @@
 # backend/orchestration/coach_service.py
+import os
 import logging
 import json
 import redis
@@ -161,15 +162,15 @@ class CoachService:
             # ==========================================
             # 🪙 6. MODEL ROUTING CONFIGURATION (COST CONTROL)
             # ==========================================
-            target_model = "gpt-4o-mini"
+            target_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-            # Complex sports-science workouts, risk warnings, or overrides route to standard gpt-4o
+            # Complex sports-science workouts, risk warnings, or overrides route to larger model
             if (
                 activity_data is not None or
                 arbitrated_plan.get("is_overridden") is True or
                 snapshot.get("predictive_risk", {}).get("injury_probability_14d", 0.0) > 0.60
             ):
-                target_model = "gpt-4o"
+                target_model = os.getenv("GROQ_MODEL_LARGE", "llama-3.3-70b-versatile")
                 logger.info(f"🎯 Dynamic Routing: Elevated complexity detected. Model set to {target_model}")
             else:
                 logger.info(f"🪙 Dynamic Routing: Standard communication. Model set to {target_model}")

@@ -23,13 +23,14 @@ class IntelligentCoach:
     """
 
     def __init__(self, openai_api_key: Optional[str] = None):
-        """Initialize OpenAI client"""
+        """Initialize OpenAI client (routes to Groq via OPENAI_BASE_URL)"""
         api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
         
-        self.client = OpenAI(api_key=api_key)
-        self.model = "gpt-4"
+        base_url = os.getenv("OPENAI_BASE_URL")
+        self.client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         self.max_tokens = 300
 
     def generate_response(self, db: Session, user_id: int, user_message: str) -> Dict:
@@ -86,11 +87,11 @@ class IntelligentCoach:
                 "content": user_message
             })
 
-            # Step 4: Call OpenAI
+            # Step 4: Call LLM (Groq-compatible chat completions)
+            full_messages = [{"role": "system", "content": system_prompt}] + messages
             response = self.client.chat.completions.create(
                 model=self.model,
-                system=system_prompt,
-                messages=messages,
+                messages=full_messages,
                 max_tokens=self.max_tokens,
                 temperature=0.7,
                 top_p=0.9

@@ -17,7 +17,7 @@ class MultiProviderLLMService:
 
     def generate_completion(self, system_instruction: str, prompt: str, target_model: str | None = None, temperature: float = 0.3) -> str:
         """Attempts generation with OpenAI, falling back to Anthropic or Gemini on failure."""
-        target_model = target_model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        target_model = target_model or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         # 1. Primary Attempt: OpenAI
         if self.openai_client:
             try:

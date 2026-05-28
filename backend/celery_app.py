@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
-STRAVA_BACKFILL_RATE_LIMIT = os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/15m")
+STRAVA_BACKFILL_RATE_LIMIT = os.getenv("STRAVA_BACKFILL_RATE_LIMIT", "95/m")
 
 logger.info(f"🔧 Initializing Celery with broker: {REDIS_URL.split('@')[1] if '@' in REDIS_URL else REDIS_URL}")
 logger.info(f"📍 Environment: {ENVIRONMENT}")
@@ -78,7 +78,7 @@ celery_app.conf.update(
             "rate_limit": STRAVA_BACKFILL_RATE_LIMIT
         },
         "backend.tasks.sync_tasks.process_strava_webhook_event": {
-            "rate_limit": "95/15m"
+            "rate_limit": "95/m"
         }
     },
 )

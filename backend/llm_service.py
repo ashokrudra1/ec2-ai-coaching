@@ -13,8 +13,8 @@ from backend.models import CoachMemory
 # 🔧 INIT - GROQ SETUP
 # =========================
 load_dotenv()
-_api_key = os.getenv("GROQ_API_KEY")
-_default_model = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+_api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+_default_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 client = Groq(api_key=_api_key)
 
 logger = logging.getLogger(__name__)

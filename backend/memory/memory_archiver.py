@@ -38,7 +38,7 @@ class MemoryArchivalEngine:
         
         try:
             # Generate the consolidated summary
-            summary = llm_router.generate_completion(system_instruction, prompt, target_model="gpt-4o-mini")
+            summary = llm_router.generate_completion(system_instruction, prompt)
             
             # Save the summarized insight
             consolidated_insight = AthleteInsight(

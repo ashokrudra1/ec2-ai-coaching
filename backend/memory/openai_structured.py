@@ -15,6 +15,7 @@ Author: Veda AI Elite Architecture Team
 import logging
 import json
 import asyncio
+import os
 from typing import Optional, Dict, Any, Type, TypeVar
 from datetime import datetime
 
@@ -29,8 +30,8 @@ T = TypeVar('T')
 
 class ModelConfig:
     """Model selection strategy"""
-    MINI_MODEL = "gpt-4o-mini"  # Cost-optimized: $0.15 / 1M input tokens
-    STANDARD_MODEL = "gpt-4o"   # Full power: $5.00 / 1M input tokens
+    MINI_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    STANDARD_MODEL = os.getenv("GROQ_MODEL_LARGE", "llama-3.3-70b-versatile")
     
     MINI_USE_CASES = {
         "compress_memories": True,
@@ -69,7 +70,8 @@ class OpenAIStructuredClient:
         
         try:
             from openai import AsyncOpenAI
-            self.client = AsyncOpenAI(api_key=self.api_key)
+            base_url = os.getenv("OPENAI_BASE_URL")
+            self.client = AsyncOpenAI(api_key=self.api_key, base_url=base_url) if base_url else AsyncOpenAI(api_key=self.api_key)
         except ImportError:
             logger.warning("openai package not available for async calls")
             self.client = None

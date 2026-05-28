@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: SecretStr = Field(..., validation_alias="OPENAI_API_KEY")
     OPENAI_BASE_URL: str = Field(default="https://api.groq.com/openai/v1", validation_alias="OPENAI_BASE_URL")
     GROQ_API_KEY: SecretStr = Field(default="", validation_alias="OPENAI_API_KEY")  # Same as OPENAI_API_KEY
-    GROQ_MODEL: str = Field(default="mixtral-8x7b-32768", validation_alias="GROQ_MODEL")
+    GROQ_MODEL: str = Field(default="llama-3.1-8b-instant", validation_alias="GROQ_MODEL")
     
     # Telegram Bot Token
     TELEGRAM_BOT_TOKEN: str = Field(..., validation_alias="TELEGRAM_BOT_TOKEN")

@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 
 class UsageGovernor:
     MODEL_COST_PER_1K_TOKENS = {
-        "gpt-4o-mini": 0.0003,
-        "gpt-4o": 0.0050,
+        "llama-3.1-8b-instant": 0.0002,
+        "llama-3.3-70b-versatile": 0.0010,
+        "llama3-8b-8192": 0.0001,
     }
 
     @staticmethod
