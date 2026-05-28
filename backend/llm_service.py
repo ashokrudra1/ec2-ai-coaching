@@ -3,30 +3,30 @@ import json
 import logging
 from datetime import datetime
 
-from openai import OpenAI
+from groq import Groq
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from backend.models import CoachMemory
 
 # =========================
-# 🔧 INIT
+# 🔧 INIT - GROQ SETUP
 # =========================
 load_dotenv()
-_api_key = os.getenv("OPENAI_API_KEY")
-_base_url = os.getenv("OPENAI_BASE_URL")
-_default_model = os.getenv("OPENAI_MODEL", "gpt-4o")
-client = OpenAI(api_key=_api_key, base_url=_base_url) if _base_url else OpenAI(api_key=_api_key)
+_api_key = os.getenv("GROQ_API_KEY")
+_default_model = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+client = Groq(api_key=_api_key)
 
 logger = logging.getLogger(__name__)
 
 
 # =========================
-# 🤖 GENERATE COACH RESPONSE
+# 🤖 GENERATE COACH RESPONSE (GROQ)
 # =========================
 def generate_coach_response(context: dict) -> str:
     """
     Main LLM call for coaching response with strict length controls.
+    Uses Groq's fast inference for real-time coaching.
     """
 
     # Enforce strict brevity, direct tips, and zero report-writing patterns
@@ -75,18 +75,19 @@ Athlete's Message:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3
+            temperature=0.3,
+            max_tokens=300  # Groq parameter for response length
         )
 
         return response.choices[0].message.content.strip()
 
-    except Exception:
-        logger.exception("❌ LLM response generation failed")
+    except Exception as e:
+        logger.exception(f"❌ LLM response generation failed: {str(e)}")
         return "⚠️ I'm having trouble analyzing right now. Try again in a moment."
 
 
 # =========================
-# 🧠 MEMORY EXTRACTION
+# 🧠 MEMORY EXTRACTION (GROQ)
 # =========================
 def extract_and_save_memory(
     db: Session,
@@ -95,7 +96,7 @@ def extract_and_save_memory(
     ai_response: str
 ):
     """
-    Extracts long-term useful insights and stores them
+    Extracts long-term useful insights and stores them using Groq
     """
 
     extraction_prompt = f"""
@@ -120,10 +121,11 @@ If nothing useful → return NONE
         response = client.chat.completions.create(
             model=_default_model,
             messages=[
-                {"role": "system", "content": "Extract structured athlete insights."},
+                {"role": "system", "content": "Extract structured athlete insights. Return only JSON."},
                 {"role": "user", "content": extraction_prompt}
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=200
         )
 
         result = response.choices[0].message.content.strip()
@@ -153,17 +155,18 @@ If nothing useful → return NONE
 
             logger.info(f"🧠 Memory saved: {insight_text}")
 
-    except Exception:
+    except Exception as e:
         db.rollback()
-        logger.exception("❌ Failed to extract memory")
+        logger.exception(f"❌ Failed to extract memory: {str(e)}")
 
 
 # =========================
-# 🩺 MEDICAL PDF ANALYSER
+# 🩺 MEDICAL PDF ANALYSER (GROQ)
 # =========================
 def process_medical_pdf_with_llm(raw_pdf_text: str, athlete_name: str) -> str:
     """
     Parses complex medical reports and summarizes critical coaching boundaries.
+    Uses Groq for fast inference on large medical text.
     """
     system_instruction = (
         "You are an Elite Medical Analyst for Endurance Training. "
@@ -192,9 +195,41 @@ RAW REPORT TEXT:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1
+            temperature=0.1,
+            max_tokens=1000
         )
         return response.choices[0].message.content.strip()
-    except Exception:
-        logger.exception("❌ Medical report extraction failed")
+    except Exception as e:
+        logger.exception(f"❌ Medical report extraction failed: {str(e)}")
         return "No specific issues identified. Proceed with baseline thresholds."
+
+
+# =========================
+# 🔄 GROQ HEALTH CHECK
+# =========================
+def check_groq_health() -> dict:
+    """
+    Check if Groq API is accessible and working
+    """
+    try:
+        response = client.chat.completions.create(
+            model=_default_model,
+            messages=[
+                {"role": "user", "content": "ping"}
+            ],
+            temperature=0,
+            max_tokens=10
+        )
+        return {
+            "status": "healthy",
+            "provider": "groq",
+            "model": _default_model,
+            "latency_ms": 0
+        }
+    except Exception as e:
+        logger.error(f"❌ Groq health check failed: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "provider": "groq",
+            "error": str(e)
+        }

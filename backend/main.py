@@ -81,6 +81,11 @@ from backend.security.usage_governance import UsageGovernor
 import redis
 import httpx
 
+def _llm_models_endpoint() -> str:
+    """Return provider-aware models endpoint (OpenAI-compatible)."""
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    return f"{base_url}/models"
+
 # ============================================================================
 # 5. LIFESPAN CONTEXT (App startup/shutdown)
 # ============================================================================
@@ -174,15 +179,15 @@ async def lifespan(app: FastAPI):
             try:
                 with httpx.Client(timeout=5.0) as client:
                     resp = client.get(
-                        "https://api.openai.com/v1/models",
-                        headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')[:10]}..."}
+                        _llm_models_endpoint(),
+                        headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
                     )
                     if resp.status_code == 200:
-                        logger.info("✅ OpenAI API is reachable")
+                        logger.info("✅ LLM provider API is reachable")
                     else:
-                        logger.warning(f"⚠️  OpenAI API returned status {resp.status_code}")
+                        logger.warning(f"⚠️  LLM provider API returned status {resp.status_code}")
             except Exception as e:
-                logger.warning(f"⚠️  OpenAI connectivity check failed: {str(e)}")
+                logger.warning(f"⚠️  LLM provider connectivity check failed: {str(e)}")
         else:
             logger.warning("⚠️  OPENAI_API_KEY not configured. LLM features disabled.")
         
@@ -403,8 +408,8 @@ def health_check_endpoint(request: Request, db: Session = Depends(get_db)):
         try:
             with httpx.Client(timeout=2.0) as client:
                 resp = client.get(
-                    "https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')[:10]}..."}
+                    _llm_models_endpoint(),
+                    headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
                 )
                 if resp.status_code == 200:
                     health_status["components"]["openai"]["status"] = "healthy"
